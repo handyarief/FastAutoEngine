@@ -9,7 +9,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="FastAuto Engine"
+        android:label="FastAuto Color Plugin"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
@@ -21,6 +21,26 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Mendaftarkan aplikasi sebagai Plug-in Decision & Action untuk Automate / Tasker -->
+        <activity
+            android:name=".PluginConfigActivity"
+            android:exported="true"
+            android:label="⚡ FastAuto Deteksi Warna">
+            <intent-filter>
+                <action android:name="com.twofortyfouram.locale.intent.action.EDIT_CONDITION" />
+                <action android:name="com.twofortyfouram.locale.intent.action.EDIT_SETTING" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".PluginFireReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.twofortyfouram.locale.intent.action.QUERY_CONDITION" />
+                <action android:name="com.twofortyfouram.locale.intent.action.FIRE_SETTING" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".FastAccessibilityService"
