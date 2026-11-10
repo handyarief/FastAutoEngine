@@ -5,7 +5,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
@@ -50,7 +52,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pendeteksi Warna < 2ms untuk Automate.\n\nCara Pakai di Automate:\n1. Nyalakan izin di bawah ini.\n2. Gunakan Alat Bidik Melayang untuk membidik warna di layar.\n3. Buka Automate -> Tambahkan blok 'Plug-in decision' -> Pilih 'FastAuto Deteksi Warna'."
+            text = "Mesin Pendeteksi Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning ke warna sasaran. Titik tengah cincin yang berlubang akan membaca warna asli di bawahnya secara akurat."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -79,8 +81,21 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        mainLayout.addView(createButton("3. Aktifkan Aksesibilitas (Jika Pakai Fitur Auto-Tap)", "#1E88E5") {
+        mainLayout.addView(createButton("3. Aktifkan Aksesibilitas (Untuk Fitur Auto-Tap)", "#1E88E5") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        })
+
+        mainLayout.addView(createButton("4. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            crosshairView?.let { wm.removeView(it); crosshairView = null }
+            floatingView?.let { wm.removeView(it); floatingView = null }
+
+            val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
+                action = "STOP_SERVICE"
+            }
+            startService(stopIntent)
+            statusText.postDelayed({ updateStatus() }, 300)
+            Toast.makeText(this, "Mesin pembaca warna berhasil dimatikan", Toast.LENGTH_SHORT).show()
         })
 
         setContentView(mainLayout)
@@ -95,7 +110,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
         val accOk = FastAccessibilityService.instance != null
-        statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ BELUM AKTIF"}\n" +
+        statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ MATI"}\n" +
                 "Fitur Auto-Tap Instan: ${if (accOk) "✅ AKTIF" else "⚪ Opsional"}"
     }
 
@@ -120,7 +135,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val colorPreview = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 30).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 36).apply {
                 setMargins(0, 10, 0, 10)
             }
             setBackgroundColor(Color.RED)
@@ -139,7 +154,7 @@ class MainActivity : AppCompatActivity() {
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("color", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Tersimpan ke Plug-in Automate: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -191,26 +206,48 @@ class MainActivity : AppCompatActivity() {
 
         wm.addView(panel, params)
         floatingView = panel
-        showCrosshair(wm, infoTv, colorPreview)
+        showHollowCrosshair(wm, infoTv, colorPreview)
     }
 
-    private fun showCrosshair(wm: WindowManager, infoTv: TextView, colorPreview: View) {
-        val target = TextView(this).apply {
-            text = "➕"
-            textSize = 26f
-            setTextColor(Color.CYAN)
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#44000000"))
-                setStroke(3, Color.YELLOW)
+    // Cincin Bidik dengan bagian tengah 100% berlubang transparan agar tidak menutupi warna layar
+    private fun showHollowCrosshair(wm: WindowManager, infoTv: TextView, colorPreview: View) {
+        val sizePx = 120
+        val target = object : View(this) {
+            private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.YELLOW
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
             }
-            setPadding(20, 10, 20, 10)
+            private val paintOuter = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.BLACK
+                style = Paint.Style.STROKE
+                strokeWidth = 7f
+            }
+            private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.CYAN
+                style = Paint.Style.STROKE
+                strokeWidth = 4f
+            }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val cx = width / 2f
+                val cy = height / 2f
+                // Lingkaran luar & dalam dengan tengah yang bolong (radius 18px kosong di tengah)
+                canvas.drawCircle(cx, cy, 38f, paintOuter)
+                canvas.drawCircle(cx, cy, 38f, paintRing)
+
+                // Garis bidik di empat sisi yang berhenti sebelum menyentuh titik tengah
+                canvas.drawLine(0f, cy, cx - 14f, cy, paintLine)
+                canvas.drawLine(cx + 14f, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - 14f, paintLine)
+                canvas.drawLine(cx, cy + 14f, cx, height.toFloat(), paintLine)
+            }
         }
 
         val cParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            sizePx,
+            sizePx,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else WindowManager.LayoutParams.TYPE_PHONE,
@@ -218,8 +255,8 @@ class MainActivity : AppCompatActivity() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = lastPickedX
-            y = lastPickedY
+            x = lastPickedX - sizePx / 2
+            y = lastPickedY - sizePx / 2
         }
 
         target.setOnTouchListener(object : View.OnTouchListener {
@@ -229,7 +266,7 @@ class MainActivity : AppCompatActivity() {
                     MotionEvent.ACTION_DOWN -> {
                         initX = cParams.x; initY = cParams.y; touchX = e.rawX; touchY = e.rawY; return true
                     }
-                    MotionEvent.ACTION_MOVE -> {
+                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
                         cParams.x = initX + (e.rawX - touchX).toInt()
                         cParams.y = initY + (e.rawY - touchY).toInt()
                         wm.updateViewLayout(target, cParams)
