@@ -2,6 +2,7 @@ package com.fastauto.engine
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.graphics.ColorSpace
 import android.graphics.Path
@@ -28,10 +29,10 @@ class FastAccessibilityService : AccessibilityService() {
             return service.dispatchGesture(gesture, null, null)
         }
 
-        // Fungsi Siluman Super Cepat (~0.05 detik) via Accessibility Android 11+ (API 30+)
+        @SuppressLint("NewApi")
         fun getStealthPixelHex(x: Int, y: Int): String? {
             val service = instance ?: return null
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+            if (Build.VERSION.SDK_INT < 30) return null
 
             var hexResult: String? = null
             val latch = CountDownLatch(1)
@@ -40,27 +41,29 @@ class FastAccessibilityService : AccessibilityService() {
                 service.takeScreenshot(
                     Display.DEFAULT_DISPLAY,
                     screenshotExecutor,
-                    object : AccessibilityService.TakeScreenshotCallback {
-                        override fun onSuccess(screenshotResult: AccessibilityService.ScreenshotResult) {
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshotResult: ScreenshotResult) {
                             val hwBuffer = screenshotResult.hardwareBuffer
                             try {
-                                val colorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
-                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                                val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
+                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
                                 if (hwBitmap != null && x >= 0 && y >= 0 && x < hwBitmap.width && y < hwBitmap.height) {
                                     val onePixel = Bitmap.createBitmap(hwBitmap, x, y, 1, 1)
                                     val softPixel = onePixel.copy(Bitmap.Config.ARGB_8888, false)
-                                    val pixel = softPixel.getPixel(0, 0)
-                                    val r = (pixel shr 16) and 0xFF
-                                    val g = (pixel shr 8) and 0xFF
-                                    val b = pixel and 0xFF
-                                    hexResult = String.format("#%02X%02X%02X", r, g, b)
-                                    softPixel.recycle()
+                                    if (softPixel != null) {
+                                        val pixel = softPixel.getPixel(0, 0)
+                                        val r = (pixel shr 16) and 0xFF
+                                        val g = (pixel shr 8) and 0xFF
+                                        val b = pixel and 0xFF
+                                        hexResult = String.format("#%02X%02X%02X", r, g, b)
+                                        softPixel.recycle()
+                                    }
                                     onePixel.recycle()
                                     hwBitmap.recycle()
                                 }
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
                             } finally {
-                                hwBuffer.close()
+                                try { hwBuffer.close() } catch (_: Throwable) {}
                                 latch.countDown()
                             }
                         }
@@ -71,15 +74,22 @@ class FastAccessibilityService : AccessibilityService() {
                     }
                 )
                 latch.await(400, TimeUnit.MILLISECONDS)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
             return hexResult
         }
 
-        // Fungsi Siluman untuk Scan Area (Mode 2) dalam 1x jepretan layar
-        fun scanStealthArea(centerX: Int, centerY: Int, radius: Int, step: Int, targetHex: String, tolerance: Int): Pair<Int, Int>? {
+        @SuppressLint("NewApi")
+        fun scanStealthArea(
+            centerX: Int,
+            centerY: Int,
+            radius: Int,
+            step: Int,
+            targetHex: String,
+            tolerance: Int
+        ): Pair<Int, Int>? {
             val service = instance ?: return null
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+            if (Build.VERSION.SDK_INT < 30) return null
 
             var hitPoint: Pair<Int, Int>? = null
             val latch = CountDownLatch(1)
@@ -88,12 +98,12 @@ class FastAccessibilityService : AccessibilityService() {
                 service.takeScreenshot(
                     Display.DEFAULT_DISPLAY,
                     screenshotExecutor,
-                    object : AccessibilityService.TakeScreenshotCallback {
-                        override fun onSuccess(screenshotResult: AccessibilityService.ScreenshotResult) {
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshotResult: ScreenshotResult) {
                             val hwBuffer = screenshotResult.hardwareBuffer
                             try {
-                                val colorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
-                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                                val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
+                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
                                 if (hwBitmap != null) {
                                     val bmpW = hwBitmap.width
                                     val bmpH = hwBitmap.height
@@ -107,29 +117,31 @@ class FastAccessibilityService : AccessibilityService() {
                                     if (cropW > 0 && cropH > 0) {
                                         val subHw = Bitmap.createBitmap(hwBitmap, left, top, cropW, cropH)
                                         val softBmp = subHw.copy(Bitmap.Config.ARGB_8888, false)
-                                        outer@ for (dy in 0 until cropH step step) {
-                                            for (dx in 0 until cropW step step) {
-                                                val pixel = softBmp.getPixel(dx, dy)
-                                                val hex = String.format(
-                                                    "#%02X%02X%02X",
-                                                    (pixel shr 16) and 0xFF,
-                                                    (pixel shr 8) and 0xFF,
-                                                    pixel and 0xFF
-                                                )
-                                                if (ScreenCaptureService.compareHex(hex, targetHex, tolerance)) {
-                                                    hitPoint = Pair(left + dx, top + dy)
-                                                    break@outer
+                                        if (softBmp != null) {
+                                            outer@ for (dy in 0 until cropH step step) {
+                                                for (dx in 0 until cropW step step) {
+                                                    val pixel = softBmp.getPixel(dx, dy)
+                                                    val hex = String.format(
+                                                        "#%02X%02X%02X",
+                                                        (pixel shr 16) and 0xFF,
+                                                        (pixel shr 8) and 0xFF,
+                                                        pixel and 0xFF
+                                                    )
+                                                    if (ScreenCaptureService.compareHex(hex, targetHex, tolerance)) {
+                                                        hitPoint = Pair(left + dx, top + dy)
+                                                        break@outer
+                                                    }
                                                 }
                                             }
+                                            softBmp.recycle()
                                         }
-                                        softBmp.recycle()
                                         subHw.recycle()
                                     }
                                     hwBitmap.recycle()
                                 }
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
                             } finally {
-                                hwBuffer.close()
+                                try { hwBuffer.close() } catch (_: Throwable) {}
                                 latch.countDown()
                             }
                         }
@@ -140,7 +152,7 @@ class FastAccessibilityService : AccessibilityService() {
                     }
                 )
                 latch.await(450, TimeUnit.MILLISECONDS)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
             return hitPoint
         }
