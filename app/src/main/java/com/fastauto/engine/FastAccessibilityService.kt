@@ -31,17 +31,21 @@ class FastAccessibilityService : AccessibilityService() {
             return service.dispatchGesture(gesture, null, null)
         }
 
-        // Fungsi yang dibutuhkan oleh FlowEngine.kt agar tidak error saat compile
-        fun findAndClickNode(targetText: String): Boolean {
+        // Dilengkapi parameter clickIfFound sesuai panggilan di FlowEngine.kt baris 93
+        fun findAndClickNode(
+            targetText: String,
+            clickIfFound: Boolean = true
+        ): Boolean {
             val service = instance ?: return false
             val root = service.rootInActiveWindow ?: return false
             val nodes = root.findAccessibilityNodeInfosByText(targetText)
             if (!nodes.isNullOrEmpty()) {
                 for (node in nodes) {
+                    if (!clickIfFound) return true
                     if (clickNodeOrParent(node)) return true
                 }
             }
-            return searchRecursive(root, targetText.lowercase())
+            return searchRecursive(root, targetText.lowercase(), clickIfFound)
         }
 
         private fun clickNodeOrParent(node: AccessibilityNodeInfo?): Boolean {
@@ -64,18 +68,23 @@ class FastAccessibilityService : AccessibilityService() {
             return false
         }
 
-        private fun searchRecursive(node: AccessibilityNodeInfo?, query: String): Boolean {
+        private fun searchRecursive(
+            node: AccessibilityNodeInfo?,
+            query: String,
+            clickIfFound: Boolean
+        ): Boolean {
             if (node == null) return false
             val text = node.text?.toString()?.lowercase() ?: ""
             val desc = node.contentDescription?.toString()?.lowercase() ?: ""
             val id = node.viewIdResourceName?.lowercase() ?: ""
 
             if (text.contains(query) || desc.contains(query) || id.contains(query)) {
+                if (!clickIfFound) return true
                 if (clickNodeOrParent(node)) return true
             }
 
             for (i in 0 until node.childCount) {
-                if (searchRecursive(node.getChild(i), query)) return true
+                if (searchRecursive(node.getChild(i), query, clickIfFound)) return true
             }
             return false
         }
