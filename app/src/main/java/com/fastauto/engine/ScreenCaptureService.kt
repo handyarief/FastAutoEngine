@@ -3,7 +3,6 @@ package com.fastauto.engine
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -12,6 +11,8 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.view.WindowManager
@@ -26,22 +27,31 @@ class ScreenCaptureService : Service() {
         private var mediaProjection: MediaProjection? = null
         private var imageReader: ImageReader? = null
         private var virtualDisplay: VirtualDisplay? = null
+        private var handlerThread: HandlerThread? = null
+        private var bgHandler: Handler? = null
 
         var screenWidth = 1080
         var screenHeight = 2400
         var screenDensity = 400
 
-        // Menyimpan buffer frame terakhir agar bisa dibaca kapan saja walau layar diam
         private var cachedBuffer: ByteArray? = null
         private var cachedRowStride = 0
         private var cachedPixelStride = 4
         private val lock = Any()
 
-        fun isReady(): Boolean = imageReader != null
+        fun isReady(): Boolean = imageReader != null && cachedBuffer != null
 
-        private fun updateFrameIfNeeded() {
-            val reader = imageReader ?: return
-            val image = try { reader.acquireLatestImage() } catch (e: Exception) { null } ?: return
+        private fun pullLatestFrame(reader: ImageReader) {
+            var image = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
+            while (true) {
+                val newer = try { reader.acquireLatestImage() } catch (_: Exception) { null }
+                if (newer != null) {
+                    image.close()
+                    image = newer
+                } else {
+                    break
+                }
+            }
             try {
                 val plane = image.planes[0]
                 val buffer: ByteBuffer = plane.buffer
@@ -61,7 +71,7 @@ class ScreenCaptureService : Service() {
         }
 
         fun getPixelHex(x: Int, y: Int): String? {
-            updateFrameIfNeeded()
+            imageReader?.let { pullLatestFrame(it) }
             synchronized(lock) {
                 val data = cachedBuffer ?: return null
                 if (x < 0 || y < 0 || x >= screenWidth || y >= screenHeight) return null
@@ -78,6 +88,10 @@ class ScreenCaptureService : Service() {
 
         fun matchColor(x: Int, y: Int, targetHex: String, tolerance: Int = 15): Boolean {
             val currentHex = getPixelHex(x, y) ?: return false
+            return compareHex(currentHex, targetHex, tolerance)
+        }
+
+        fun compareHex(currentHex: String, targetHex: String, tolerance: Int): Boolean {
             return try {
                 val c1 = Color.parseColor(currentHex)
                 val cleanTarget = if (targetHex.startsWith("#")) targetHex else "#$targetHex"
@@ -123,15 +137,30 @@ class ScreenCaptureService : Service() {
         screenHeight = metrics.heightPixels
         screenDensity = metrics.densityDpi
 
+        handlerThread = HandlerThread("ScreenCaptureThread").apply { start() }
+        bgHandler = Handler(handlerThread!!.looper)
+
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpManager.getMediaProjection(resultCode, data)
 
-        imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
+        // Wajib mendaftarkan callback pada Android 14+
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopProjection()
+            }
+        }, bgHandler)
+
+        imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 3).apply {
+            setOnImageAvailableListener({ reader ->
+                pullLatestFrame(reader)
+            }, bgHandler)
+        }
+
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "FastColorCapture",
             screenWidth, screenHeight, screenDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
+            imageReader?.surface, null, bgHandler
         )
     }
 
@@ -142,6 +171,9 @@ class ScreenCaptureService : Service() {
         imageReader = null
         mediaProjection?.stop()
         mediaProjection = null
+        handlerThread?.quitSafely()
+        handlerThread = null
+        bgHandler = null
     }
 
     private fun startForegroundServiceNotification() {
@@ -152,7 +184,7 @@ class ScreenCaptureService : Service() {
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("FastAuto Engine Aktif")
-            .setContentText("Mesin pembaca warna siap bekerja")
+            .setContentText("Mesin pembaca warna real-time siap bekerja")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .build()
         startForeground(1, notification)
