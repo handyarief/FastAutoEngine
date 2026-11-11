@@ -29,34 +29,33 @@ class PluginFireReceiver : BroadcastReceiver() {
         val timeout = bundle.getLong("timeout", 2000L)
         val autoTap = bundle.getBoolean("autoTap", false)
 
-        // Jika Mesin Baca Warna belum diaktifkan, langsung lempar ke jalur NO!
-        if (!ScreenCaptureService.isReady()) {
+        val ramReady = ScreenCaptureService.isReady()
+        val stealthReady = FastAccessibilityService.instance != null
+
+        // Jika Mesin RAM mati DAN Aksesibilitas juga mati, beri peringatan
+        if (!ramReady && !stealthReady) {
             Handler(Looper.getMainLooper()).post {
-                Toast.makeText(context, "⚠️ Mesin Warna Belum Aktif! Buka aplikasi FastAuto dulu.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "⚠️ Aktifkan Aksesibilitas (No. 3) untuk Mode Siluman!", Toast.LENGTH_SHORT).show()
             }
             resultCode = RESULT_CONDITION_UNSATISFIED
             return
         }
 
-        // Mode 0 (Cek Instan) dieksekusi langsung tanpa Thread agar Automate 100% akurat menerima YES/NO
-        if (mode == 0) {
+        // JALUR CEPAT 1: Jika Mesin RAM menyala & Mode 0
+        if (ramReady && mode == 0) {
             val actualHex = ScreenCaptureService.getPixelHex(x, y) ?: "#000000"
             val matched = ScreenCaptureService.compareHex(actualHex, hex, tolerance)
-
-            if (matched && autoTap) {
-                FastAccessibilityService.tap(x, y)
-            }
+            if (matched && autoTap) FastAccessibilityService.tap(x, y)
 
             Handler(Looper.getMainLooper()).post {
-                val status = if (matched) "✅ COCOK (YES)" else "❌ BEDA (NO)"
-                Toast.makeText(context, "Layar: $actualHex | Target: $hex -> $status", Toast.LENGTH_SHORT).show()
+                val status = if (matched) "✅ COCOK" else "❌ BEDA"
+                Toast.makeText(context, "[RAM] Layar: $actualHex | Target: $hex -> $status", Toast.LENGTH_SHORT).show()
             }
-
             resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
             return
         }
 
-        // Mode 1 (Tunggu Warna) & Mode 2 (Scan Area)
+        // JALUR SILUMAN (STEALTH) ATAU MODE TUNGGU/SCAN AREA
         val pendingResult = goAsync()
         Thread {
             var matched = false
@@ -64,31 +63,43 @@ class PluginFireReceiver : BroadcastReceiver() {
             var hitY = y
             var lastSeenHex = "#000000"
 
-            if (mode == 1) {
+            if (mode == 0) {
+                // Mode 0 via Siluman (~0.05 detik)
+                lastSeenHex = FastAccessibilityService.getStealthPixelHex(x, y) ?: "#000000"
+                matched = ScreenCaptureService.compareHex(lastSeenHex, hex, tolerance)
+            } else if (mode == 1) {
                 val startTime = System.currentTimeMillis()
                 while (System.currentTimeMillis() - startTime < timeout) {
-                    lastSeenHex = ScreenCaptureService.getPixelHex(x, y) ?: "#000000"
+                    lastSeenHex = if (ScreenCaptureService.isReady()) {
+                        ScreenCaptureService.getPixelHex(x, y) ?: "#000000"
+                    } else {
+                        FastAccessibilityService.getStealthPixelHex(x, y) ?: "#000000"
+                    }
                     if (ScreenCaptureService.compareHex(lastSeenHex, hex, tolerance)) {
                         matched = true
                         break
                     }
-                    Thread.sleep(5)
+                    Thread.sleep(if (ScreenCaptureService.isReady()) 10L else 320L)
                 }
             } else if (mode == 2) {
-                val radius = 100
-                val step = 5
-                outer@ for (dy in -radius..radius step step) {
-                    for (dx in -radius..radius step step) {
-                        val cx = x + dx
-                        val cy = y + dy
-                        val cur = ScreenCaptureService.getPixelHex(cx, cy) ?: continue
-                        lastSeenHex = cur
-                        if (ScreenCaptureService.compareHex(cur, hex, tolerance)) {
-                            matched = true
-                            hitX = cx
-                            hitY = cy
-                            break@outer
+                if (ScreenCaptureService.isReady()) {
+                    val radius = 100
+                    val step = 5
+                    outer@ for (dy in -radius..radius step step) {
+                        for (dx in -radius..radius step step) {
+                            val cx = x + dx
+                            val cy = y + dy
+                            val cur = ScreenCaptureService.getPixelHex(cx, cy) ?: continue
+                            lastSeenHex = cur
+                            if (ScreenCaptureService.compareHex(cur, hex, tolerance)) {
+                                matched = true; hitX = cx; hitY = cy; break@outer
+                            }
                         }
+                    }
+                } else {
+                    val hit = FastAccessibilityService.scanStealthArea(x, y, 100, 5, hex, tolerance)
+                    if (hit != null) {
+                        matched = true; hitX = hit.first; hitY = hit.second; lastSeenHex = hex
                     }
                 }
             }
@@ -98,8 +109,9 @@ class PluginFireReceiver : BroadcastReceiver() {
             }
 
             Handler(Looper.getMainLooper()).post {
-                val status = if (matched) "✅ COCOK (YES)" else "❌ BEDA (NO)"
-                Toast.makeText(context, "Layar: $lastSeenHex | Target: $hex -> $status", Toast.LENGTH_SHORT).show()
+                val modeTag = if (ramReady) "[RAM]" else "[SILUMAN]"
+                val status = if (matched) "✅ COCOK" else "❌ BEDA"
+                Toast.makeText(context, "$modeTag Layar: $lastSeenHex | Target: $hex -> $status", Toast.LENGTH_SHORT).show()
             }
 
             pendingResult.resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
