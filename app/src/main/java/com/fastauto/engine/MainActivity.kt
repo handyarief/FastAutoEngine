@@ -52,7 +52,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pendeteksi Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning ke warna sasaran. Titik tengah cincin yang berlubang akan membaca warna asli di bawahnya secara akurat."
+            text = "Mesin Pendeteksi 2 Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning ke warna sasaran, lalu simpan sebagai Target Warna 1 atau Target Warna 2."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity() {
             startActivityForResult(mpManager.createScreenCaptureIntent(), 1001)
         })
 
-        mainLayout.addView(createButton("2. Munculkan Alat Bidik Warna Melayang (🎯)", "#00897B") {
+        mainLayout.addView(createButton("2. Munculkan Alat Bidik Warna 1 & 2 (🎯)", "#00897B") {
             if (!Settings.canDrawOverlays(this)) {
                 val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                 startActivityForResult(intent, 1002)
@@ -81,11 +81,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        mainLayout.addView(createButton("3. Aktifkan Aksesibilitas (Untuk Fitur Auto-Tap)", "#1E88E5") {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        })
-
-        mainLayout.addView(createButton("4. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
+        mainLayout.addView(createButton("3. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             crosshairView?.let { wm.removeView(it); crosshairView = null }
             floatingView?.let { wm.removeView(it); floatingView = null }
@@ -109,9 +105,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
-        val accOk = FastAccessibilityService.instance != null
-        statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ MATI"}\n" +
-                "Fitur Auto-Tap Instan: ${if (accOk) "✅ AKTIF" else "⚪ Opsional"}"
+        statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ MATI"}"
     }
 
     private fun showFloatingPicker() {
@@ -141,8 +135,8 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.RED)
         }
 
-        val copyBtn = Button(this).apply {
-            text = "📋 Kunci & Salin"
+        val saveBtn1 = Button(this).apply {
+            text = "🎯 Simpan ke Warna 1"
             textSize = 11f
             setBackgroundColor(Color.parseColor("#1E88E5"))
             setTextColor(Color.WHITE)
@@ -153,8 +147,28 @@ class MainActivity : AppCompatActivity() {
                     .putString("picked_hex", lastPickedHex)
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cb.setPrimaryClip(ClipData.newPlainText("color", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                cb.setPrimaryClip(ClipData.newPlainText("color1", lastPickedHex))
+                Toast.makeText(this@MainActivity, "Warna 1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val saveBtn2 = Button(this).apply {
+            text = "🎯 Simpan ke Warna 2"
+            textSize = 11f
+            setBackgroundColor(Color.parseColor("#8E24AA"))
+            setTextColor(Color.WHITE)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.setMargins(0, 8, 0, 8)
+            layoutParams = lp
+            setOnClickListener {
+                getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
+                    .putInt("picked_x2", lastPickedX)
+                    .putInt("picked_y2", lastPickedY)
+                    .putString("picked_hex2", lastPickedHex)
+                    .apply()
+                val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cb.setPrimaryClip(ClipData.newPlainText("color2", lastPickedHex))
+                Toast.makeText(this@MainActivity, "Warna 2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -169,7 +183,8 @@ class MainActivity : AppCompatActivity() {
 
         panel.addView(infoTv)
         panel.addView(colorPreview)
-        panel.addView(copyBtn)
+        panel.addView(saveBtn1)
+        panel.addView(saveBtn2)
         panel.addView(closeBtn)
 
         val params = WindowManager.LayoutParams(
@@ -209,7 +224,6 @@ class MainActivity : AppCompatActivity() {
         showHollowCrosshair(wm, infoTv, colorPreview)
     }
 
-    // Cincin Bidik dengan bagian tengah 100% berlubang transparan agar tidak menutupi warna layar
     private fun showHollowCrosshair(wm: WindowManager, infoTv: TextView, colorPreview: View) {
         val sizePx = 120
         val target = object : View(this) {
@@ -233,11 +247,9 @@ class MainActivity : AppCompatActivity() {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                // Lingkaran luar & dalam dengan tengah yang bolong (radius 18px kosong di tengah)
                 canvas.drawCircle(cx, cy, 38f, paintOuter)
                 canvas.drawCircle(cx, cy, 38f, paintRing)
 
-                // Garis bidik di empat sisi yang berhenti sebelum menyentuh titik tengah
                 canvas.drawLine(0f, cy, cx - 14f, cy, paintLine)
                 canvas.drawLine(cx + 14f, cy, width.toFloat(), cy, paintLine)
                 canvas.drawLine(cx, 0f, cx, cy - 14f, paintLine)
@@ -280,12 +292,6 @@ class MainActivity : AppCompatActivity() {
                         lastPickedY = centerY
                         val hex = ScreenCaptureService.getPixelHex(centerX, centerY) ?: "#000000"
                         lastPickedHex = hex
-
-                        getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
-                            .putInt("picked_x", centerX)
-                            .putInt("picked_y", centerY)
-                            .putString("picked_hex", hex)
-                            .apply()
 
                         infoTv.text = "X: $centerX, Y: $centerY\nHex: $hex"
                         try { colorPreview.setBackgroundColor(Color.parseColor(hex)) } catch (_: Exception) {}
