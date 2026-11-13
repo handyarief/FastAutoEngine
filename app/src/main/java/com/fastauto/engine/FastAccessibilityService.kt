@@ -106,15 +106,14 @@ class FastAccessibilityService : AccessibilityService() {
                             try {
                                 val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
                                 val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
-                                if (hwBitmap != null && x in 0 until hwBitmap.width && y in 0 until hwBitmap.height) {
-                                    val onePixel = Bitmap.createBitmap(hwBitmap, x, y, 1, 1)
-                                    val softPixel = onePixel.copy(Bitmap.Config.ARGB_8888, false)
-                                    if (softPixel != null) {
-                                        val pixel = softPixel.getPixel(0, 0)
+                                if (hwBitmap != null) {
+                                    // Salin ke ARGB_8888 dulu sebelum akses piksel (Hardware Bitmap tidak bisa di-crop langsung di banyak device)
+                                    val softBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                    if (softBitmap != null && x in 0 until softBitmap.width && y in 0 until softBitmap.height) {
+                                        val pixel = softBitmap.getPixel(x, y)
                                         hexResult = String.format("#%06X", pixel and 0xFFFFFF)
-                                        softPixel.recycle()
+                                        softBitmap.recycle()
                                     }
-                                    onePixel.recycle()
                                     hwBitmap.recycle()
                                 }
                             } catch (_: Throwable) {
@@ -162,19 +161,18 @@ class FastAccessibilityService : AccessibilityService() {
                                 val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
                                 val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
                                 if (hwBitmap != null) {
-                                    val left = (centerX - radius).coerceAtLeast(0)
-                                    val top = (centerY - radius).coerceAtLeast(0)
-                                    val right = (centerX + radius).coerceAtMost(hwBitmap.width - 1)
-                                    val bottom = (centerY + radius).coerceAtMost(hwBitmap.height - 1)
-                                    val cropW = right - left + 1
-                                    val cropH = bottom - top + 1
+                                    val softBmp = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                    if (softBmp != null) {
+                                        val left = (centerX - radius).coerceAtLeast(0)
+                                        val top = (centerY - radius).coerceAtLeast(0)
+                                        val right = (centerX + radius).coerceAtMost(softBmp.width - 1)
+                                        val bottom = (centerY + radius).coerceAtMost(softBmp.height - 1)
+                                        val cropW = right - left + 1
+                                        val cropH = bottom - top + 1
 
-                                    if (cropW > 0 && cropH > 0) {
-                                        val subHw = Bitmap.createBitmap(hwBitmap, left, top, cropW, cropH)
-                                        val softBmp = subHw.copy(Bitmap.Config.ARGB_8888, false)
-                                        if (softBmp != null) {
+                                        if (cropW > 0 && cropH > 0) {
                                             val pixels = IntArray(cropW * cropH)
-                                            softBmp.getPixels(pixels, 0, cropW, 0, 0, cropW, cropH)
+                                            softBmp.getPixels(pixels, 0, cropW, left, top, cropW, cropH)
 
                                             outer@ for (dy in 0 until cropH step step) {
                                                 val rowOffset = dy * cropW
@@ -186,9 +184,8 @@ class FastAccessibilityService : AccessibilityService() {
                                                     }
                                                 }
                                             }
-                                            softBmp.recycle()
                                         }
-                                        subHw.recycle()
+                                        softBmp.recycle()
                                     }
                                     hwBitmap.recycle()
                                 }
