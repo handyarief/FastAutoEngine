@@ -9,27 +9,46 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private var floatingView: View? = null
     private var crosshairView: View? = null
+    private var dpadView: View? = null
+
     private var lastPickedX = 540
     private var lastPickedY = 1200
     private var lastPickedHex = "#FF0000"
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var repeatRunnable: Runnable? = null
+
+    private var infoTvRef: TextView? = null
+    private var hexTvRef: TextView? = null
+    private var colorPreviewDrawable: GradientDrawable? = null
+    private var cParamsRef: WindowManager.LayoutParams? = null
+    private val crosshairSizePx = 96
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,7 +71,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pendeteksi 2 Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning ke warna sasaran, lalu simpan sebagai Target Warna 1 atau Target Warna 2."
+            text = "Mesin Pendeteksi 2 Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad (Atas/Bawah/Kiri/Kanan) untuk mengepaskan titik piksel secara presisi."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -72,7 +91,7 @@ class MainActivity : AppCompatActivity() {
             startActivityForResult(mpManager.createScreenCaptureIntent(), 1001)
         })
 
-        mainLayout.addView(createButton("2. Munculkan Alat Bidik Warna 1 & 2 (🎯)", "#00897B") {
+        mainLayout.addView(createButton("2. Munculkan Alat Bidik + Joystick (🎯)", "#00897B") {
             if (!Settings.canDrawOverlays(this)) {
                 val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                 startActivityForResult(intent, 1002)
@@ -82,10 +101,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         mainLayout.addView(createButton("3. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
-            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            crosshairView?.let { wm.removeView(it); crosshairView = null }
-            floatingView?.let { wm.removeView(it); floatingView = null }
-
+            removeAllOverlays()
             val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 action = "STOP_SERVICE"
             }
@@ -108,38 +124,160 @@ class MainActivity : AppCompatActivity() {
         statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ MATI"}"
     }
 
+    private fun removeAllOverlays() {
+        stopRepeatMove()
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        crosshairView?.let { try { wm.removeView(it) } catch (_: Exception) {}; crosshairView = null }
+        floatingView?.let { try { wm.removeView(it) } catch (_: Exception) {}; floatingView = null }
+        dpadView?.let { try { wm.removeView(it) } catch (_: Exception) {}; dpadView = null }
+    }
+
+    private fun refreshColorAt(x: Int, y: Int) {
+        val maxW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
+        val maxH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
+        lastPickedX = x.coerceIn(0, maxW - 1)
+        lastPickedY = y.coerceIn(0, maxH - 1)
+
+        val hex = ScreenCaptureService.getPixelHex(lastPickedX, lastPickedY) ?: "#000000"
+        lastPickedHex = hex
+
+        infoTvRef?.text = "X: $lastPickedX   Y: $lastPickedY"
+        hexTvRef?.text = hex
+        try {
+            colorPreviewDrawable?.setColor(Color.parseColor(hex))
+        } catch (_: Exception) {}
+    }
+
+    private fun moveCrosshairBy(dx: Int, dy: Int) {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val target = crosshairView ?: return
+        val cParams = cParamsRef ?: return
+
+        val maxW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
+        val maxH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
+
+        lastPickedX = (lastPickedX + dx).coerceIn(0, maxW - 1)
+        lastPickedY = (lastPickedY + dy).coerceIn(0, maxH - 1)
+
+        cParams.x = lastPickedX - crosshairSizePx / 2
+        cParams.y = lastPickedY - crosshairSizePx / 2
+        try {
+            wm.updateViewLayout(target, cParams)
+        } catch (_: Exception) {}
+
+        refreshColorAt(lastPickedX, lastPickedY)
+    }
+
+    private fun stopRepeatMove() {
+        repeatRunnable?.let { uiHandler.removeCallbacks(it) }
+        repeatRunnable = null
+    }
+
     private fun showFloatingPicker() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (floatingView != null) return
 
+        // ================= 1. PANEL INFO COMPACT & PROPORSIONAL =================
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24, 20, 24, 20)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#EE111111"))
-                cornerRadius = 24f
-                setStroke(3, Color.parseColor("#00E676"))
+                setColor(Color.parseColor("#E6141414"))
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1).coerceAtLeast(2), Color.parseColor("#00E676"))
             }
+        }
+
+        // Baris Atas: Kotak Preview Warna Besar + Teks Koordinat & Hex Jelas + Tombol Tutup
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val swatchBg = GradientDrawable().apply {
+            setColor(Color.RED)
+            cornerRadius = dp(6).toFloat()
+            setStroke(dp(2), Color.WHITE)
+        }
+        colorPreviewDrawable = swatchBg
+
+        val colorPreview = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                setMargins(0, 0, dp(8), 0)
+            }
+            background = swatchBg
+        }
+
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
         val infoTv = TextView(this).apply {
-            text = "X: $lastPickedX, Y: $lastPickedY\nHex: $lastPickedHex"
-            textSize = 12f
-            setTextColor(Color.WHITE)
+            text = "X: $lastPickedX   Y: $lastPickedY"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(Color.parseColor("#E0E0E0"))
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setSingleLine(true)
         }
+        infoTvRef = infoTv
 
-        val colorPreview = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 36).apply {
-                setMargins(0, 10, 0, 10)
+        val hexTv = TextView(this).apply {
+            text = lastPickedHex
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTextColor(Color.parseColor("#00E676"))
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setSingleLine(true)
+        }
+        hexTvRef = hexTv
+
+        textCol.addView(infoTv)
+        textCol.addView(hexTv)
+
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#C62828"))
+                cornerRadius = dp(6).toFloat()
             }
-            setBackgroundColor(Color.RED)
+            layoutParams = LinearLayout.LayoutParams(dp(26), dp(26)).apply {
+                setMargins(dp(6), 0, 0, 0)
+            }
+            setOnClickListener { removeAllOverlays() }
         }
 
-        val saveBtn1 = Button(this).apply {
-            text = "🎯 Simpan ke Warna 1"
-            textSize = 11f
-            setBackgroundColor(Color.parseColor("#1E88E5"))
+        topRow.addView(colorPreview)
+        topRow.addView(textCol)
+        topRow.addView(closeBtn)
+
+        // Baris Bawah: 2 Tombol Simpan Berdampingan & Ringkas
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, dp(6), 0, 0)
+            }
+        }
+
+        val saveBtn1 = TextView(this).apply {
+            text = "🎯 Warna 1"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1E88E5"))
+                cornerRadius = dp(6).toFloat()
+            }
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, dp(4), 0)
+            }
             setOnClickListener {
                 getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
                     .putInt("picked_x", lastPickedX)
@@ -148,18 +286,24 @@ class MainActivity : AppCompatActivity() {
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("color1", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Warna 1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "W1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
-        val saveBtn2 = Button(this).apply {
-            text = "🎯 Simpan ke Warna 2"
-            textSize = 11f
-            setBackgroundColor(Color.parseColor("#8E24AA"))
+        val saveBtn2 = TextView(this).apply {
+            text = "🎯 Warna 2"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.setMargins(0, 8, 0, 8)
-            layoutParams = lp
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#8E24AA"))
+                cornerRadius = dp(6).toFloat()
+            }
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(4), 0, 0, 0)
+            }
             setOnClickListener {
                 getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
                     .putInt("picked_x2", lastPickedX)
@@ -168,92 +312,234 @@ class MainActivity : AppCompatActivity() {
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("color2", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Warna 2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "W2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
-        val closeBtn = Button(this).apply {
-            text = "❌ Tutup Bidik"
-            textSize = 10f
-            setOnClickListener {
-                crosshairView?.let { wm.removeView(it); crosshairView = null }
-                floatingView?.let { wm.removeView(it); floatingView = null }
-            }
-        }
+        btnRow.addView(saveBtn1)
+        btnRow.addView(saveBtn2)
 
-        panel.addView(infoTv)
-        panel.addView(colorPreview)
-        panel.addView(saveBtn1)
-        panel.addView(saveBtn2)
-        panel.addView(closeBtn)
+        panel.addView(topRow)
+        panel.addView(btnRow)
+
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else WindowManager.LayoutParams.TYPE_PHONE
 
         val params = WindowManager.LayoutParams(
+            dp(215),
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else WindowManager.LayoutParams.TYPE_PHONE,
+            overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 30
-            y = 200
+            x = dp(12)
+            y = dp(80)
         }
 
-        panel.setOnTouchListener(object : View.OnTouchListener {
-            var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
+        makeDraggable(panel, params, wm)
+
+        wm.addView(panel, params)
+        floatingView = panel
+
+        showHollowCrosshair(wm)
+        showDraggableJoystick(wm)
+        refreshColorAt(lastPickedX, lastPickedY)
+    }
+
+    // ================= 2. JOYSTIK D-PAD PROPORSIONAL & BISA DIPINDAH-PINDAH =================
+    private fun showDraggableJoystick(wm: WindowManager) {
+        if (dpadView != null) return
+
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else WindowManager.LayoutParams.TYPE_PHONE
+
+        val dpadParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = dp(240)
+            y = dp(80)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(5), dp(5), dp(5), dp(5))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#D9181818"))
+                cornerRadius = dp(14).toFloat()
+                setStroke(dp(1).coerceAtLeast(2), Color.parseColor("#00E676"))
+            }
+        }
+
+        val btnSize = dp(32)
+        val gap = dp(2)
+
+        fun createDirBtn(symbol: String, dx: Int, dy: Int): TextView {
+            return TextView(this).apply {
+                text = symbol
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                val normalBg = GradientDrawable().apply {
+                    setColor(Color.parseColor("#2C2C2C"))
+                    cornerRadius = dp(7).toFloat()
+                    setStroke(1, Color.parseColor("#555555"))
+                }
+                val pressedBg = GradientDrawable().apply {
+                    setColor(Color.parseColor("#00897B"))
+                    cornerRadius = dp(7).toFloat()
+                }
+                background = normalBg
+                layoutParams = LinearLayout.LayoutParams(btnSize, btnSize).apply {
+                    setMargins(gap, gap, gap, gap)
+                }
+
+                setOnTouchListener { v, event ->
+                    when (event.action) {
+                        MotionEvent.ACTION_DOWN -> {
+                            v.background = pressedBg
+                            moveCrosshairBy(dx, dy)
+                            stopRepeatMove()
+                            repeatRunnable = object : Runnable {
+                                override fun run() {
+                                    moveCrosshairBy(dx, dy)
+                                    uiHandler.postDelayed(this, 45L)
+                                }
+                            }
+                            uiHandler.postDelayed(repeatRunnable!!, 300L)
+                            true
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                            v.background = normalBg
+                            stopRepeatMove()
+                            true
+                        }
+                        else -> false
+                    }
+                }
+            }
+        }
+
+        // Tombol Tengah (Pegangan Geser Joystick)
+        val centerDragBtn = TextView(this).apply {
+            text = "✥"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(Color.parseColor("#00E676"))
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1F1F1F"))
+                cornerRadius = dp(7).toFloat()
+                setStroke(1, Color.parseColor("#00E676"))
+            }
+            layoutParams = LinearLayout.LayoutParams(btnSize, btnSize).apply {
+                setMargins(gap, gap, gap, gap)
+            }
+        }
+
+        val rowTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(createDirBtn("▲", 0, -1))
+        }
+
+        val rowMid = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(createDirBtn("◀", -1, 0))
+            addView(centerDragBtn)
+            addView(createDirBtn("▶", 1, 0))
+        }
+
+        val rowBot = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(createDirBtn("▼", 0, 1))
+        }
+
+        container.addView(rowTop)
+        container.addView(rowMid)
+        container.addView(rowBot)
+
+        makeDraggable(centerDragBtn, dpadParams, wm, container)
+        makeDraggable(container, dpadParams, wm, container)
+
+        wm.addView(container, dpadParams)
+        dpadView = container
+    }
+
+    private fun makeDraggable(
+        touchView: View,
+        layoutParams: WindowManager.LayoutParams,
+        wm: WindowManager,
+        targetViewToUpdate: View = touchView
+    ) {
+        touchView.setOnTouchListener(object : View.OnTouchListener {
+            var initX = 0
+            var initY = 0
+            var touchX = 0f
+            var touchY = 0f
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        initX = params.x; initY = params.y; touchX = e.rawX; touchY = e.rawY; return true
+                        initX = layoutParams.x
+                        initY = layoutParams.y
+                        touchX = e.rawX
+                        touchY = e.rawY
+                        return true
                     }
                     MotionEvent.ACTION_MOVE -> {
-                        params.x = initX + (e.rawX - touchX).toInt()
-                        params.y = initY + (e.rawY - touchY).toInt()
-                        wm.updateViewLayout(panel, params)
+                        layoutParams.x = initX + (e.rawX - touchX).toInt()
+                        layoutParams.y = initY + (e.rawY - touchY).toInt()
+                        try {
+                            wm.updateViewLayout(targetViewToUpdate, layoutParams)
+                        } catch (_: Exception) {}
                         return true
                     }
                 }
                 return false
             }
         })
-
-        wm.addView(panel, params)
-        floatingView = panel
-        showHollowCrosshair(wm, infoTv, colorPreview)
     }
 
-    private fun showHollowCrosshair(wm: WindowManager, infoTv: TextView, colorPreview: View) {
-        val sizePx = 120
+    // ================= 3. LUBANG BIDIK (CROSSHAIR) =================
+    private fun showHollowCrosshair(wm: WindowManager) {
+        val sizePx = crosshairSizePx
         val target = object : View(this) {
             private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.YELLOW
                 style = Paint.Style.STROKE
-                strokeWidth = 5f
+                strokeWidth = 4f
             }
             private val paintOuter = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.BLACK
                 style = Paint.Style.STROKE
-                strokeWidth = 7f
+                strokeWidth = 6f
             }
             private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.CYAN
                 style = Paint.Style.STROKE
-                strokeWidth = 4f
+                strokeWidth = 3.5f
             }
 
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                canvas.drawCircle(cx, cy, 38f, paintOuter)
-                canvas.drawCircle(cx, cy, 38f, paintRing)
+                canvas.drawCircle(cx, cy, 30f, paintOuter)
+                canvas.drawCircle(cx, cy, 30f, paintRing)
 
-                canvas.drawLine(0f, cy, cx - 14f, cy, paintLine)
-                canvas.drawLine(cx + 14f, cy, width.toFloat(), cy, paintLine)
-                canvas.drawLine(cx, 0f, cx, cy - 14f, paintLine)
-                canvas.drawLine(cx, cy + 14f, cx, height.toFloat(), paintLine)
+                canvas.drawLine(0f, cy, cx - 10f, cy, paintLine)
+                canvas.drawLine(cx + 10f, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - 10f, paintLine)
+                canvas.drawLine(cx, cy + 10f, cx, height.toFloat(), paintLine)
             }
         }
 
@@ -270,6 +556,7 @@ class MainActivity : AppCompatActivity() {
             x = lastPickedX - sizePx / 2
             y = lastPickedY - sizePx / 2
         }
+        cParamsRef = cParams
 
         target.setOnTouchListener(object : View.OnTouchListener {
             var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
@@ -288,13 +575,7 @@ class MainActivity : AppCompatActivity() {
                         val centerX = loc[0] + target.width / 2
                         val centerY = loc[1] + target.height / 2
 
-                        lastPickedX = centerX
-                        lastPickedY = centerY
-                        val hex = ScreenCaptureService.getPixelHex(centerX, centerY) ?: "#000000"
-                        lastPickedHex = hex
-
-                        infoTv.text = "X: $centerX, Y: $centerY\nHex: $hex"
-                        try { colorPreview.setBackgroundColor(Color.parseColor(hex)) } catch (_: Exception) {}
+                        refreshColorAt(centerX, centerY)
                         return true
                     }
                 }
