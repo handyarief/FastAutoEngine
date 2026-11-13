@@ -25,7 +25,6 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
@@ -40,12 +39,17 @@ class MainActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var repeatRunnable: Runnable? = null
+    private var delayedSampleRunnable: Runnable? = null
 
     private var infoTvRef: TextView? = null
     private var hexTvRef: TextView? = null
     private var colorPreviewDrawable: GradientDrawable? = null
     private var cParamsRef: WindowManager.LayoutParams? = null
     private val crosshairSizePx = 96
+
+    // Offset otomatis jika sistem tetap memberi pergeseran inset pada perangkat tertentu
+    private var statusOffsetX = 0
+    private var statusOffsetY = 0
 
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
@@ -126,10 +130,43 @@ class MainActivity : AppCompatActivity() {
 
     private fun removeAllOverlays() {
         stopRepeatMove()
+        delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         crosshairView?.let { try { wm.removeView(it) } catch (_: Exception) {}; crosshairView = null }
         floatingView?.let { try { wm.removeView(it) } catch (_: Exception) {}; floatingView = null }
         dpadView?.let { try { wm.removeView(it) } catch (_: Exception) {}; dpadView = null }
+    }
+
+    /**
+     * Membaca posisi fisik sesungguhnya dari titik tengah lubang Crosshair di layar penuh (termasuk Status Bar & Cutout)
+     */
+    private fun syncAndRefreshFromCrosshair() {
+        val target = crosshairView ?: return
+        target.post {
+            val loc = IntArray(2)
+            target.getLocationOnScreen(loc)
+
+            val cParams = cParamsRef
+            if (cParams != null) {
+                statusOffsetX = loc[0] - cParams.x
+                statusOffsetY = loc[1] - cParams.y
+            }
+
+            val trueCenterX = loc[0] + (target.width / 2)
+            val trueCenterY = loc[1] + (target.height / 2)
+            refreshColorAt(trueCenterX, trueCenterY)
+
+            // Baca ulang setelah frame baru MediaProjection dirender (45ms kemudian)
+            delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
+            delayedSampleRunnable = Runnable {
+                val locAfter = IntArray(2)
+                target.getLocationOnScreen(locAfter)
+                val cx = locAfter[0] + (target.width / 2)
+                val cy = locAfter[1] + (target.height / 2)
+                refreshColorAt(cx, cy)
+            }
+            uiHandler.postDelayed(delayedSampleRunnable!!, 45L)
+        }
     }
 
     private fun refreshColorAt(x: Int, y: Int) {
@@ -138,7 +175,9 @@ class MainActivity : AppCompatActivity() {
         lastPickedX = x.coerceIn(0, maxW - 1)
         lastPickedY = y.coerceIn(0, maxH - 1)
 
-        val hex = ScreenCaptureService.getPixelHex(lastPickedX, lastPickedY) ?: "#000000"
+        val hex = ScreenCaptureService.getPixelHex(lastPickedX, lastPickedY)
+            ?: FastAccessibilityService.getStealthPixelHex(lastPickedX, lastPickedY)
+            ?: "#000000"
         lastPickedHex = hex
 
         infoTvRef?.text = "X: $lastPickedX   Y: $lastPickedY"
@@ -156,16 +195,24 @@ class MainActivity : AppCompatActivity() {
         val maxW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
         val maxH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
 
-        lastPickedX = (lastPickedX + dx).coerceIn(0, maxW - 1)
-        lastPickedY = (lastPickedY + dy).coerceIn(0, maxH - 1)
+        // Ambil posisi layar fisik saat ini lalu geser sejauh dx, dy
+        val loc = IntArray(2)
+        target.getLocationOnScreen(loc)
+        val currentScreenX = loc[0] + (target.width / 2)
+        val currentScreenY = loc[1] + (target.height / 2)
 
-        cParams.x = lastPickedX - crosshairSizePx / 2
-        cParams.y = lastPickedY - crosshairSizePx / 2
+        val nextScreenX = (currentScreenX + dx).coerceIn(0, maxW - 1)
+        val nextScreenY = (currentScreenY + dy).coerceIn(0, maxH - 1)
+
+        // Konversi balik ke koordinat WindowManager dengan mengkompensasi offset sistem (jika ada)
+        cParams.x = nextScreenX - (crosshairSizePx / 2) - statusOffsetX
+        cParams.y = nextScreenY - (crosshairSizePx / 2) - statusOffsetY
+
         try {
             wm.updateViewLayout(target, cParams)
         } catch (_: Exception) {}
 
-        refreshColorAt(lastPickedX, lastPickedY)
+        syncAndRefreshFromCrosshair()
     }
 
     private fun stopRepeatMove() {
@@ -177,7 +224,6 @@ class MainActivity : AppCompatActivity() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (floatingView != null) return
 
-        // ================= 1. PANEL INFO COMPACT & PROPORSIONAL =================
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -188,7 +234,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Baris Atas: Kotak Preview Warna Besar + Teks Koordinat & Hex Jelas + Tombol Tutup
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -253,7 +298,6 @@ class MainActivity : AppCompatActivity() {
         topRow.addView(textCol)
         topRow.addView(closeBtn)
 
-        // Baris Bawah: 2 Tombol Simpan Berdampingan & Ringkas
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -279,6 +323,7 @@ class MainActivity : AppCompatActivity() {
                 setMargins(0, 0, dp(4), 0)
             }
             setOnClickListener {
+                syncAndRefreshFromCrosshair()
                 getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
                     .putInt("picked_x", lastPickedX)
                     .putInt("picked_y", lastPickedY)
@@ -305,6 +350,7 @@ class MainActivity : AppCompatActivity() {
                 setMargins(dp(4), 0, 0, 0)
             }
             setOnClickListener {
+                syncAndRefreshFromCrosshair()
                 getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
                     .putInt("picked_x2", lastPickedX)
                     .putInt("picked_y2", lastPickedY)
@@ -330,12 +376,12 @@ class MainActivity : AppCompatActivity() {
             dp(215),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = dp(12)
-            y = dp(80)
+            y = dp(100)
         }
 
         makeDraggable(panel, params, wm)
@@ -345,10 +391,9 @@ class MainActivity : AppCompatActivity() {
 
         showHollowCrosshair(wm)
         showDraggableJoystick(wm)
-        refreshColorAt(lastPickedX, lastPickedY)
+        syncAndRefreshFromCrosshair()
     }
 
-    // ================= 2. JOYSTIK D-PAD PROPORSIONAL & BISA DIPINDAH-PINDAH =================
     private fun showDraggableJoystick(wm: WindowManager) {
         if (dpadView != null) return
 
@@ -360,12 +405,12 @@ class MainActivity : AppCompatActivity() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = dp(240)
-            y = dp(80)
+            y = dp(100)
         }
 
         val container = LinearLayout(this).apply {
@@ -428,7 +473,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Tombol Tengah (Pegangan Geser Joystick)
         val centerDragBtn = TextView(this).apply {
             text = "✥"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -495,12 +539,14 @@ class MainActivity : AppCompatActivity() {
                         touchY = e.rawY
                         return true
                     }
-                    MotionEvent.ACTION_MOVE -> {
+                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
                         layoutParams.x = initX + (e.rawX - touchX).toInt()
                         layoutParams.y = initY + (e.rawY - touchY).toInt()
                         try {
                             wm.updateViewLayout(targetViewToUpdate, layoutParams)
                         } catch (_: Exception) {}
+                        // Segarkan juga bacaan warna bila panel digeser menjauh dari crosshair
+                        syncAndRefreshFromCrosshair()
                         return true
                     }
                 }
@@ -509,39 +555,45 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // ================= 3. LUBANG BIDIK (CROSSHAIR) =================
     private fun showHollowCrosshair(wm: WindowManager) {
         val sizePx = crosshairSizePx
         val target = object : View(this) {
             private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.YELLOW
                 style = Paint.Style.STROKE
-                strokeWidth = 4f
+                strokeWidth = 3.5f
             }
             private val paintOuter = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.BLACK
                 style = Paint.Style.STROKE
-                strokeWidth = 6f
+                strokeWidth = 5.5f
             }
             private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.CYAN
                 style = Paint.Style.STROKE
-                strokeWidth = 3.5f
+                strokeWidth = 3f
             }
 
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
+                // Lubang tengah dibuat berjarak 12px dari titik pusat agar anti-aliasing garis tidak pernah mengotori piksel tengah
                 canvas.drawCircle(cx, cy, 30f, paintOuter)
                 canvas.drawCircle(cx, cy, 30f, paintRing)
 
-                canvas.drawLine(0f, cy, cx - 10f, cy, paintLine)
-                canvas.drawLine(cx + 10f, cy, width.toFloat(), cy, paintLine)
-                canvas.drawLine(cx, 0f, cx, cy - 10f, paintLine)
-                canvas.drawLine(cx, cy + 10f, cx, height.toFloat(), paintLine)
+                canvas.drawLine(0f, cy, cx - 12f, cy, paintLine)
+                canvas.drawLine(cx + 12f, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - 12f, paintLine)
+                canvas.drawLine(cx, cy + 12f, cx, height.toFloat(), paintLine)
             }
         }
+
+        // KUNCI UTAMA AKURASI: Gunakan FLAG_LAYOUT_IN_SCREEN + FLAG_LAYOUT_NO_LIMITS + CUTOUT_MODE_ALWAYS
+        // agar sistem koordinat (0,0) WindowManager sama persis dengan pojok kiri-atas layar fisik MediaProjection
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
         val cParams = WindowManager.LayoutParams(
             sizePx,
@@ -549,12 +601,15 @@ class MainActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            flags,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = lastPickedX - sizePx / 2
             y = lastPickedY - sizePx / 2
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            }
         }
         cParamsRef = cParams
 
@@ -563,19 +618,20 @@ class MainActivity : AppCompatActivity() {
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        initX = cParams.x; initY = cParams.y; touchX = e.rawX; touchY = e.rawY; return true
+                        initX = cParams.x
+                        initY = cParams.y
+                        touchX = e.rawX
+                        touchY = e.rawY
+                        return true
                     }
                     MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
                         cParams.x = initX + (e.rawX - touchX).toInt()
                         cParams.y = initY + (e.rawY - touchY).toInt()
-                        wm.updateViewLayout(target, cParams)
+                        try {
+                            wm.updateViewLayout(target, cParams)
+                        } catch (_: Exception) {}
 
-                        val loc = IntArray(2)
-                        target.getLocationOnScreen(loc)
-                        val centerX = loc[0] + target.width / 2
-                        val centerY = loc[1] + target.height / 2
-
-                        refreshColorAt(centerX, centerY)
+                        syncAndRefreshFromCrosshair()
                         return true
                     }
                 }
