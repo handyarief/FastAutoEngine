@@ -2,21 +2,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Izin overlay untuk tampilan pemilih warna -->
-    <uses-permission
-        android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Izin foreground service -->
-    <uses-permission
-        android:name="android.permission.FOREGROUND_SERVICE" />
-
-    <!-- Izin khusus MediaProjection untuk Android 14+ -->
-    <uses-permission
-        android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-
-    <!-- Izin notifikasi Android 13+ -->
-    <uses-permission
-        android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -24,7 +13,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
-        <!-- Aplikasi utama -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -36,7 +24,6 @@
 
         </activity>
 
-        <!-- Editor konfigurasi untuk Automate / Tasker -->
         <activity
             android:name=".PluginConfigActivity"
             android:exported="true"
@@ -49,7 +36,6 @@
 
         </activity>
 
-        <!-- Penerima perintah dari Automate / Tasker -->
         <receiver
             android:name=".PluginFireReceiver"
             android:exported="true">
@@ -61,7 +47,6 @@
 
         </receiver>
 
-        <!-- Accessibility Service -->
         <service
             android:name=".FastAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
@@ -78,7 +63,6 @@
 
         </service>
 
-        <!-- Mesin tangkapan layar MediaProjection -->
         <service
             android:name=".ScreenCaptureService"
             android:enabled="true"
