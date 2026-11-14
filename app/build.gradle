@@ -1,3 +1,4 @@
+
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
@@ -5,34 +6,44 @@ plugins {
 
 android {
     namespace 'com.fastauto.engine'
+
     compileSdk 34
 
     defaultConfig {
         applicationId "com.fastauto.engine"
+
         minSdk 26
         targetSdk 34
+
         versionCode 1
         versionName "1.0"
     }
 
     buildTypes {
         release {
+            // Jangan aktifkan minify sebelum pengujian integrasi.
             minifyEnabled false
         }
     }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
     kotlinOptions {
         jvmTarget = '17'
     }
 }
 
 dependencies {
-    implementation 'androidx.core:core-ktx:1.12.0'
+
+    // Digunakan MainActivity dan komponen AppCompat.
     implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
+
+    // Digunakan ScreenCaptureService untuk NotificationCompat.
+    implementation 'androidx.core:core-ktx:1.12.0'
+
+    // Digunakan FlowEngine dan proses coroutine.
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
-    implementation 'com.google.code.gson:gson:2.10.1'
 }
