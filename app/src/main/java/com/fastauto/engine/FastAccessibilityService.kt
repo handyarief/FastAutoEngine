@@ -91,11 +91,17 @@ class FastAccessibilityService : AccessibilityService() {
         }
 
         @SuppressLint("NewApi")
-        fun getStealthPixelHex(x: Int, y: Int): String? {
-            val service = instance ?: return null
-            if (Build.VERSION.SDK_INT < 30) return null
+        fun getStealthPixelRgbInt(x: Int, y: Int): Int? {
+            return getStealthTwoPixelsRgbInt(x, y, -1, -1).first
+        }
 
-            var hexResult: String? = null
+        @SuppressLint("NewApi")
+        fun getStealthTwoPixelsRgbInt(x1: Int, y1: Int, x2: Int, y2: Int): Pair<Int?, Int?> {
+            val service = instance ?: return Pair(null, null)
+            if (Build.VERSION.SDK_INT < 30) return Pair(null, null)
+
+            var rgb1: Int? = null
+            var rgb2: Int? = null
             val latch = CountDownLatch(1)
 
             try {
@@ -109,11 +115,14 @@ class FastAccessibilityService : AccessibilityService() {
                                 val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
                                 val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
                                 if (hwBitmap != null) {
-                                    // Salin ke ARGB_8888 dulu sebelum akses piksel (Hardware Bitmap tidak bisa di-crop langsung di banyak device)
                                     val softBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                                    if (softBitmap != null && x in 0 until softBitmap.width && y in 0 until softBitmap.height) {
-                                        val pixel = softBitmap.getPixel(x, y)
-                                        hexResult = String.format("#%06X", pixel and 0xFFFFFF)
+                                    if (softBitmap != null) {
+                                        if (x1 in 0 until softBitmap.width && y1 in 0 until softBitmap.height) {
+                                            rgb1 = softBitmap.getPixel(x1, y1) and 0xFFFFFF
+                                        }
+                                        if (x2 in 0 until softBitmap.width && y2 in 0 until softBitmap.height) {
+                                            rgb2 = softBitmap.getPixel(x2, y2) and 0xFFFFFF
+                                        }
                                         softBitmap.recycle()
                                     }
                                     hwBitmap.recycle()
@@ -130,10 +139,16 @@ class FastAccessibilityService : AccessibilityService() {
                         }
                     }
                 )
-                latch.await(350, TimeUnit.MILLISECONDS)
+                latch.await(320, TimeUnit.MILLISECONDS)
             } catch (_: Throwable) {
             }
-            return hexResult
+            return Pair(rgb1, rgb2)
+        }
+
+        @SuppressLint("NewApi")
+        fun getStealthPixelHex(x: Int, y: Int): String? {
+            val rgb = getStealthPixelRgbInt(x, y) ?: return null
+            return String.format("#%06X", rgb and 0xFFFFFF)
         }
 
         @SuppressLint("NewApi")
@@ -203,7 +218,7 @@ class FastAccessibilityService : AccessibilityService() {
                         }
                     }
                 )
-                latch.await(380, TimeUnit.MILLISECONDS)
+                latch.await(350, TimeUnit.MILLISECONDS)
             } catch (_: Throwable) {
             }
             return hitPoint
@@ -222,13 +237,28 @@ class FastAccessibilityService : AccessibilityService() {
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
 
+        // Hanya periksa popup peringatan jika event berasal dari komponen sistem/keamanan
+        val pkg = event.packageName?.toString()?.lowercase() ?: ""
+        if (pkg.isNotEmpty() &&
+            !pkg.contains("systemui") &&
+            !pkg.contains("android") &&
+            !pkg.contains("security") &&
+            !pkg.contains("permission") &&
+            !pkg.contains("coloros") &&
+            !pkg.contains("oplus") &&
+            !pkg.contains("miui") &&
+            !pkg.contains("vivo") &&
+            !pkg.contains("samsung")
+        ) {
+            return
+        }
+
         val now = System.currentTimeMillis()
-        if (now - lastDismissTime < 120L) return
+        if (now - lastDismissTime < 250L) return
 
         try {
             val root = rootInActiveWindow ?: return
 
-            // Cek apakah di layar muncul teks peringatan "Risk screen sharing" atau "Potential Telecom Fraud"
             val hasRiskWarning = !root.findAccessibilityNodeInfosByText("Risk screen sharing").isNullOrEmpty() ||
                                  !root.findAccessibilityNodeInfosByText("Potential Telecom Fraud").isNullOrEmpty()
 
