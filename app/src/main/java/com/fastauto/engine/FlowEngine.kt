@@ -1,12 +1,17 @@
 package com.fastauto.engine
 
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 enum class BlockType {
-    CHECK_COLOR,      // Cek warna di (X,Y) -> Cabang YES / NO
-    TAP_COORDINATE,   // Tap cepat di (X,Y) -> Lanjut ke YES
-    FIND_CLICK_TEXT,  // Cari Teks/ID (XPath) & Klik -> Cabang YES / NO
-    DELAY_MS          // Jeda milidetik -> Lanjut ke YES
+    CHECK_COLOR,
+    TAP_COORDINATE,
+    FIND_CLICK_TEXT,
+    DELAY_MS
 }
 
 data class FlowBlock(
@@ -19,11 +24,12 @@ data class FlowBlock(
     var tolerance: Int = 20,
     var textQuery: String = "",
     var delayMs: Long = 50L,
-    var nextYesId: Int = 0, // 0 = Stop, atau ID blok tujuan jika YES
-    var nextNoId: Int = 0   // 0 = Stop, atau ID blok tujuan jika NO
+    var nextYesId: Int = 0,
+    var nextNoId: Int = 0
 )
 
 object FlowEngine {
+    @Volatile
     var isRunning = false
     private var job: Job? = null
     var statusLog: String = "Siap"
@@ -31,12 +37,12 @@ object FlowEngine {
     val blocks = mutableListOf(
         FlowBlock(
             id = 1,
-            title = "Cek Warna & Tap Cepat",
+            title = "Cari Warna Area & Tap",
             type = BlockType.CHECK_COLOR,
             x = 540, y = 1200,
             targetHex = "#FF0000",
             nextYesId = 2,
-            nextNoId = 1 // Ulangi pantau blok 1 terus-menerus tanpa jeda jika belum muncul
+            nextNoId = 1
         ),
         FlowBlock(
             id = 2,
@@ -53,6 +59,7 @@ object FlowEngine {
         isRunning = true
         job = CoroutineScope(Dispatchers.Default).launch {
             var currentId = if (blocks.isNotEmpty()) blocks.first().id else 0
+            var lastReportedId = -1
             while (isActive && isRunning && currentId != 0) {
                 val block = blocks.find { it.id == currentId }
                 if (block == null) {
@@ -60,14 +67,15 @@ object FlowEngine {
                     break
                 }
 
-                statusLog = "Menjalankan Blok #${block.id}: ${block.title}"
-                onUpdate(statusLog)
+                if (block.id != lastReportedId) {
+                    statusLog = "Menjalankan Blok #${block.id}: ${block.title}"
+                    onUpdate(statusLog)
+                    lastReportedId = block.id
+                }
 
                 val result = executeBlock(block)
                 currentId = if (result) block.nextYesId else block.nextNoId
-
-                // Jeda mikro 2ms agar HP tidak freeze saat looping ke diri sendiri
-                delay(2L)
+                delay(16L)
             }
             isRunning = false
             onUpdate("Berhenti")
