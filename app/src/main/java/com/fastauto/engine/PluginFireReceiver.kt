@@ -3,12 +3,16 @@ package com.fastauto.engine
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import java.util.concurrent.Executors
 
 class PluginFireReceiver : BroadcastReceiver() {
 
     companion object {
         const val RESULT_CONDITION_SATISFIED = 16
         const val RESULT_CONDITION_UNSATISFIED = 17
+
+        // Satu Reusable Thread Statis (Tanpa alokasi Thread baru agar hemat CPU & RAM)
+        private val workerExecutor = Executors.newSingleThreadExecutor()
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -18,22 +22,30 @@ class PluginFireReceiver : BroadcastReceiver() {
             return
         }
 
-        val mode = bundle.getInt("mode", 0)
-        val x1 = bundle.getInt("x", 500)
-        val y1 = bundle.getInt("y", 500)
-        val hex1 = bundle.getString("hex", "#FF0000") ?: "#FF0000"
+        val x1 = bundle.getInt("x", 540)
+        val y1 = bundle.getInt("y", 1200)
+        val targetRgb1 = if (bundle.containsKey("rgb1")) {
+            bundle.getInt("rgb1")
+        } else {
+            ScreenCaptureService.parseHexToInt(bundle.getString("hex", "#FF0000") ?: "#FF0000")
+        }
 
         val useColor2 = bundle.getBoolean("useColor2", false)
         val colorLogic = bundle.getInt("colorLogic", 0) // 0 = AND, 1 = OR
-        val x2 = bundle.getInt("x2", 500)
-        val y2 = bundle.getInt("y2", 500)
-        val hex2 = bundle.getString("hex2", "#00FF00") ?: "#00FF00"
+        val x2 = bundle.getInt("x2", 540)
+        val y2 = bundle.getInt("y2", 1200)
+        val targetRgb2 = if (!useColor2) {
+            0
+        } else if (bundle.containsKey("rgb2")) {
+            bundle.getInt("rgb2")
+        } else {
+            ScreenCaptureService.parseHexToInt(bundle.getString("hex2", "#00FF00") ?: "#00FF00")
+        }
 
+        val radius = bundle.getInt("radius", 100)
+        val step = bundle.getInt("step", 4)
         val tolerance = bundle.getInt("tolerance", 20)
-        val timeout = bundle.getLong("timeout", 1000L)
-
-        val targetRgb1 = ScreenCaptureService.parseHexToInt(hex1)
-        val targetRgb2 = if (useColor2) ScreenCaptureService.parseHexToInt(hex2) else 0
+        val timeout = bundle.getLong("timeout", 0L)
 
         val ramReady = ScreenCaptureService.isReady()
         val stealthReady = FastAccessibilityService.instance != null
@@ -43,149 +55,59 @@ class PluginFireReceiver : BroadcastReceiver() {
             return
         }
 
-        // JALUR SUPER CEPAT (< 0.05 ms Tanpa Alokasi Thread): Mesin RAM Aktif pada Mode 0 atau Mode 2
-        if (ramReady && (mode == 0 || mode == 2)) {
-            val matched = if (mode == 0) {
-                checkRamPointCondition(
-                    x1, y1, targetRgb1,
-                    useColor2, colorLogic,
-                    x2, y2, targetRgb2,
-                    tolerance
-                )
-            } else {
-                checkRamAreaCondition(
-                    x1, y1, targetRgb1,
-                    useColor2, colorLogic,
-                    x2, y2, targetRgb2,
-                    tolerance
-                )
-            }
+        // JALUR SUPER CEPAT (< 0.001 ms Tanpa Alokasi Thread) saat Mesin RAM Siap & Timeout == 0
+        if (ramReady && timeout <= 0L) {
+            val matched = ScreenCaptureService.evaluateAreaInstantOrWait(
+                x1, y1, targetRgb1,
+                useColor2, colorLogic,
+                x2, y2, targetRgb2,
+                radius, step, tolerance,
+                0L
+            )
             resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
             return
         }
 
-        // JALUR ASYNC (Khusus Mode 1 Tunggu Warna, atau Mode Siluman Tanpa MediaProjection)
+        // JALUR TUNGGU FRAME-SYNC ATAU STEALTH CADANGAN (Memakai Reusable Executor)
         val pendingResult = goAsync()
-        Thread {
+        workerExecutor.execute {
             var matched = false
             try {
-                when (mode) {
-                    0 -> {
-                        matched = checkStealthPointCondition(
-                            x1, y1, targetRgb1,
-                            useColor2, colorLogic,
-                            x2, y2, targetRgb2,
-                            tolerance
+                if (ScreenCaptureService.isReady()) {
+                    matched = ScreenCaptureService.evaluateAreaInstantOrWait(
+                        x1, y1, targetRgb1,
+                        useColor2, colorLogic,
+                        x2, y2, targetRgb2,
+                        radius, step, tolerance,
+                        timeout
+                    )
+                } else {
+                    val waitBudget = timeout.coerceIn(0L, 8000L)
+                    val startTime = System.currentTimeMillis()
+                    do {
+                        val m1 = FastAccessibilityService.scanStealthAreaRgb(
+                            x1, y1, radius, step, targetRgb1, tolerance
                         )
-                    }
-                    1 -> {
-                        val startTime = System.currentTimeMillis()
-                        while (System.currentTimeMillis() - startTime < timeout) {
-                            if (ScreenCaptureService.isReady()) {
-                                if (checkRamPointCondition(
-                                        x1, y1, targetRgb1,
-                                        useColor2, colorLogic,
-                                        x2, y2, targetRgb2,
-                                        tolerance
-                                    )
-                                ) {
-                                    matched = true
-                                    break
-                                }
-                                Thread.sleep(4L)
-                            } else {
-                                if (checkStealthPointCondition(
-                                        x1, y1, targetRgb1,
-                                        useColor2, colorLogic,
-                                        x2, y2, targetRgb2,
-                                        tolerance
-                                    )
-                                ) {
-                                    matched = true
-                                    break
-                                }
-                                Thread.sleep(250L)
-                            }
-                        }
-                    }
-                    2 -> {
-                        matched = if (ScreenCaptureService.isReady()) {
-                            checkRamAreaCondition(
-                                x1, y1, targetRgb1,
-                                useColor2, colorLogic,
-                                x2, y2, targetRgb2,
-                                tolerance
+                        matched = if (!useColor2) {
+                            m1
+                        } else if (colorLogic == 0) {
+                            m1 && FastAccessibilityService.scanStealthAreaRgb(
+                                x2, y2, radius, step, targetRgb2, tolerance
                             )
                         } else {
-                            val m1 = FastAccessibilityService.scanStealthArea(x1, y1, 100, 4, hex1, tolerance) != null
-                            if (!useColor2) {
-                                m1
-                            } else if (colorLogic == 0) {
-                                m1 && (FastAccessibilityService.scanStealthArea(x2, y2, 100, 4, hex2, tolerance) != null)
-                            } else {
-                                m1 || (FastAccessibilityService.scanStealthArea(x2, y2, 100, 4, hex2, tolerance) != null)
-                            }
+                            m1 || FastAccessibilityService.scanStealthAreaRgb(
+                                x2, y2, radius, step, targetRgb2, tolerance
+                            )
                         }
-                    }
+                        if (matched || waitBudget <= 0L) break
+                        Thread.sleep(150L)
+                    } while (System.currentTimeMillis() - startTime < waitBudget)
                 }
             } catch (_: Throwable) {
             } finally {
                 pendingResult.resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
                 pendingResult.finish()
             }
-        }.start()
-    }
-
-    private fun checkRamPointCondition(
-        x1: Int, y1: Int, targetRgb1: Int,
-        useColor2: Boolean, colorLogic: Int,
-        x2: Int, y2: Int, targetRgb2: Int,
-        tolerance: Int
-    ): Boolean {
-        if (!useColor2) {
-            val rgb1 = ScreenCaptureService.getPixelRgbInt(x1, y1) ?: return false
-            return ScreenCaptureService.compareRgbInt(rgb1, targetRgb1, tolerance)
         }
-
-        // Ambil 2 piksel sekaligus dalam 1x Lock & 1x Tarik Frame
-        val (rgb1, rgb2) = ScreenCaptureService.getTwoPixelsRgbInt(x1, y1, x2, y2)
-        val m1 = rgb1 != null && ScreenCaptureService.compareRgbInt(rgb1, targetRgb1, tolerance)
-        if (colorLogic == 0 && !m1) return false // Short-circuit AND
-        if (colorLogic == 1 && m1) return true   // Short-circuit OR
-
-        val m2 = rgb2 != null && ScreenCaptureService.compareRgbInt(rgb2, targetRgb2, tolerance)
-        return m2
-    }
-
-    private fun checkRamAreaCondition(
-        x1: Int, y1: Int, targetRgb1: Int,
-        useColor2: Boolean, colorLogic: Int,
-        x2: Int, y2: Int, targetRgb2: Int,
-        tolerance: Int
-    ): Boolean {
-        val m1 = ScreenCaptureService.scanRamAreaFast(x1, y1, 100, 4, targetRgb1, tolerance)
-        if (!useColor2) return m1
-        if (colorLogic == 0 && !m1) return false
-        if (colorLogic == 1 && m1) return true
-
-        return ScreenCaptureService.scanRamAreaFast(x2, y2, 100, 4, targetRgb2, tolerance)
-    }
-
-    private fun checkStealthPointCondition(
-        x1: Int, y1: Int, targetRgb1: Int,
-        useColor2: Boolean, colorLogic: Int,
-        x2: Int, y2: Int, targetRgb2: Int,
-        tolerance: Int
-    ): Boolean {
-        if (!useColor2) {
-            val rgb1 = FastAccessibilityService.getStealthPixelRgbInt(x1, y1) ?: return false
-            return ScreenCaptureService.compareRgbInt(rgb1, targetRgb1, tolerance)
-        }
-
-        // Ambil 2 piksel sekaligus hanya dengan 1x Screenshot
-        val (rgb1, rgb2) = FastAccessibilityService.getStealthTwoPixelsRgbInt(x1, y1, x2, y2)
-        val m1 = rgb1 != null && ScreenCaptureService.compareRgbInt(rgb1, targetRgb1, tolerance)
-        val m2 = rgb2 != null && ScreenCaptureService.compareRgbInt(rgb2, targetRgb2, tolerance)
-        return if (colorLogic == 0) (m1 && m2) else (m1 || m2)
     }
 }
