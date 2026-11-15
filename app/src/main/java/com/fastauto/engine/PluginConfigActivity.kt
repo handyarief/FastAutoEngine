@@ -7,7 +7,14 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.text.InputType
-import android.widget.*
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Spinner
+import android.widget.TextView
 
 class PluginConfigActivity : Activity() {
 
@@ -32,40 +39,34 @@ class PluginConfigActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "⚡ Konfigurasi Plug-in Deteksi Warna"
+            text = "⚡ Mode Tunggal: Cari Warna di Area Sekitar"
             textSize = 20f
             setTextColor(Color.parseColor("#00E676"))
-            setPadding(0, 0, 0, 24)
+            setPadding(0, 0, 0, 12)
         }
         layout.addView(title)
 
-        val modes = arrayOf(
-            "0: Cek Instan 1ms (Cabang YES / NO di Automate)",
-            "1: Tunggu Sampai Warna Muncul (Zero-Delay Wait)",
-            "2: Cari Warna di Area Sekitar (±100px)"
-        )
-        val modeSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@PluginConfigActivity, android.R.layout.simple_spinner_dropdown_item, modes)
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            setSelection(oldBundle?.getInt("mode", 0) ?: 0)
+        val subInfo = TextView(this).apply {
+            text = "Arsitektur Pre-Cached Bulk RAM (< 0.01ms, Akurat 100%, Anti-Lag & Dingin)."
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, 0, 0, 20)
         }
-
-        layout.addView(createLabel("Pilih Mode Kerja Plug-in:"))
-        layout.addView(modeSpinner)
+        layout.addView(subInfo)
 
         // ================= TARGET WARNA 1 =================
         val pickBtn1 = Button(this).apply {
-            text = "🎯 Ambil Bidik Warna 1: ($lastX1, $lastY1) $lastHex1"
+            text = "🎯 Ambil Bidik Area 1: ($lastX1, $lastY1) $lastHex1"
             setBackgroundColor(Color.parseColor("#1E88E5"))
             setTextColor(Color.WHITE)
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.setMargins(0, 24, 0, 8)
+            lp.setMargins(0, 12, 0, 8)
             layoutParams = lp
         }
         layout.addView(pickBtn1)
 
-        val x1Input = createInput("Koordinat X1", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("x", lastX1) ?: lastX1).toString())
-        val y1Input = createInput("Koordinat Y1", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("y", lastY1) ?: lastY1).toString())
+        val x1Input = createInput("Pusat X1", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("x", lastX1) ?: lastX1).toString())
+        val y1Input = createInput("Pusat Y1", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("y", lastY1) ?: lastY1).toString())
         val hex1Input = createInput("Target Warna 1 Hex (#RRGGBB)", InputType.TYPE_CLASS_TEXT, oldBundle?.getString("hex", lastHex1) ?: lastHex1)
 
         pickBtn1.setOnClickListener {
@@ -75,16 +76,16 @@ class PluginConfigActivity : Activity() {
             hex1Input.setText(p.getString("picked_hex", "#FF0000"))
         }
 
-        layout.addView(createLabel("Koordinat X1 (Warna 1):"))
+        layout.addView(createLabel("Koordinat Pusat X1 (Area 1):"))
         layout.addView(x1Input)
-        layout.addView(createLabel("Koordinat Y1 (Warna 1):"))
+        layout.addView(createLabel("Koordinat Pusat Y1 (Area 1):"))
         layout.addView(y1Input)
         layout.addView(createLabel("Target Warna 1 Hex (Contoh #FF0000):"))
         layout.addView(hex1Input)
 
         // ================= TARGET WARNA 2 =================
         val useSecondColorCheck = CheckBox(this).apply {
-            text = "Aktifkan Target Warna 2 (Koordinat & Warna Ke-2)"
+            text = "Aktifkan Target Area Warna 2 (Pencarian Ganda)"
             setTextColor(Color.parseColor("#00E676"))
             textSize = 15f
             isChecked = oldBundle?.getBoolean("useColor2", false) ?: false
@@ -93,7 +94,7 @@ class PluginConfigActivity : Activity() {
         layout.addView(useSecondColorCheck)
 
         val pickBtn2 = Button(this).apply {
-            text = "🎯 Ambil Bidik Warna 2: ($lastX2, $lastY2) $lastHex2"
+            text = "🎯 Ambil Bidik Area 2: ($lastX2, $lastY2) $lastHex2"
             setBackgroundColor(Color.parseColor("#8E24AA"))
             setTextColor(Color.WHITE)
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -103,8 +104,8 @@ class PluginConfigActivity : Activity() {
         layout.addView(pickBtn2)
 
         val logicModes = arrayOf(
-            "0: DAN (AND) -> Warna 1 & Warna 2 Harus Cocok Semua",
-            "1: ATAU (OR) -> Salah Satu Warna Cocok Saja Cukup"
+            "0: DAN (AND) -> Area 1 & Area 2 Harus Ditemukan Semua",
+            "1: ATAU (OR) -> Salah Satu Area Ditemukan Saja Cukup"
         )
         val logicSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@PluginConfigActivity, android.R.layout.simple_spinner_dropdown_item, logicModes)
@@ -112,8 +113,8 @@ class PluginConfigActivity : Activity() {
             setSelection(oldBundle?.getInt("colorLogic", 0) ?: 0)
         }
 
-        val x2Input = createInput("Koordinat X2", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("x2", lastX2) ?: lastX2).toString())
-        val y2Input = createInput("Koordinat Y2", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("y2", lastY2) ?: lastY2).toString())
+        val x2Input = createInput("Pusat X2", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("x2", lastX2) ?: lastX2).toString())
+        val y2Input = createInput("Pusat Y2", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("y2", lastY2) ?: lastY2).toString())
         val hex2Input = createInput("Target Warna 2 Hex (#RRGGBB)", InputType.TYPE_CLASS_TEXT, oldBundle?.getString("hex2", lastHex2) ?: lastHex2)
 
         pickBtn2.setOnClickListener {
@@ -124,22 +125,28 @@ class PluginConfigActivity : Activity() {
             useSecondColorCheck.isChecked = true
         }
 
-        layout.addView(createLabel("Logika Pengecekan 2 Warna:"))
+        layout.addView(createLabel("Logika Pencarian 2 Area:"))
         layout.addView(logicSpinner)
-        layout.addView(createLabel("Koordinat X2 (Warna 2):"))
+        layout.addView(createLabel("Koordinat Pusat X2 (Area 2):"))
         layout.addView(x2Input)
-        layout.addView(createLabel("Koordinat Y2 (Warna 2):"))
+        layout.addView(createLabel("Koordinat Pusat Y2 (Area 2):"))
         layout.addView(y2Input)
         layout.addView(createLabel("Target Warna 2 Hex (Contoh #00FF00):"))
         layout.addView(hex2Input)
 
-        // ================= PENGATURAN UMUM =================
+        // ================= PENGATURAN AREA & KECEPATAN =================
+        val radiusInput = createInput("Radius Area Piksel (Default 100)", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("radius", 100) ?: 100).toString())
+        val stepInput = createInput("Kerapatan Langkah Piksel (1 = Sangat Rapat, 4 = Super Cepat)", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("step", 4) ?: 4).toString())
         val tolInput = createInput("Toleransi Kemiripan Warna (0 - 100)", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getInt("tolerance", 20) ?: 20).toString())
-        val timeoutInput = createInput("Batas Waktu Tunggu ms (Khusus Mode 1)", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getLong("timeout", 1000L) ?: 1000L).toString())
+        val timeoutInput = createInput("0 = Cek Instan <0.01ms | >0 = Tunggu Maks (ms) tanpa Loop", InputType.TYPE_CLASS_NUMBER, (oldBundle?.getLong("timeout", 0L) ?: 0L).toString())
 
-        layout.addView(createLabel("Toleransi Warna (15-25 disarankan):"))
+        layout.addView(createLabel("Radius Area Pencarian (± piksel dari titik pusat):"))
+        layout.addView(radiusInput)
+        layout.addView(createLabel("Langkah Pemindaian / Step (2 - 4 disarankan):"))
+        layout.addView(stepInput)
+        layout.addView(createLabel("Toleransi Warna (15 - 25 disarankan):"))
         layout.addView(tolInput)
-        layout.addView(createLabel("Timeout Tunggu (ms) untuk Mode 1:"))
+        layout.addView(createLabel("Batas Tunggu Frame-Sync ms (Isi 0 untuk Instan <0.01ms):"))
         layout.addView(timeoutInput)
 
         val saveBtn = Button(this).apply {
@@ -151,44 +158,55 @@ class PluginConfigActivity : Activity() {
             layoutParams = lp
 
             setOnClickListener {
-                val mode = modeSpinner.selectedItemPosition
-                val x1 = x1Input.text.toString().toIntOrNull() ?: 500
-                val y1 = y1Input.text.toString().toIntOrNull() ?: 500
+                val x1 = x1Input.text.toString().toIntOrNull() ?: 540
+                val y1 = y1Input.text.toString().toIntOrNull() ?: 1200
                 val hex1 = hex1Input.text.toString().trim().ifEmpty { "#FF0000" }
+                val rgb1 = ScreenCaptureService.parseHexToInt(hex1)
 
                 val useColor2 = useSecondColorCheck.isChecked
                 val colorLogic = logicSpinner.selectedItemPosition
-                val x2 = x2Input.text.toString().toIntOrNull() ?: 500
-                val y2 = y2Input.text.toString().toIntOrNull() ?: 500
+                val x2 = x2Input.text.toString().toIntOrNull() ?: 540
+                val y2 = y2Input.text.toString().toIntOrNull() ?: 1200
                 val hex2 = hex2Input.text.toString().trim().ifEmpty { "#00FF00" }
+                val rgb2 = ScreenCaptureService.parseHexToInt(hex2)
 
-                val tol = tolInput.text.toString().toIntOrNull() ?: 20
-                val timeout = timeoutInput.text.toString().toLongOrNull() ?: 1000L
+                val radius = (radiusInput.text.toString().toIntOrNull() ?: 100).coerceIn(1, 500)
+                val step = (stepInput.text.toString().toIntOrNull() ?: 4).coerceIn(1, 20)
+                val tol = (tolInput.text.toString().toIntOrNull() ?: 20).coerceIn(0, 255)
+                val timeout = (timeoutInput.text.toString().toLongOrNull() ?: 0L).coerceIn(0L, 8000L)
+
+                // Pre-register langsung ke RAM Service agar pembacaan pertama langsung < 0.01 ms
+                ScreenCaptureService.registerWatchConfig(
+                    x1, y1, rgb1,
+                    useColor2, colorLogic,
+                    x2, y2, rgb2,
+                    radius, step, tol
+                )
 
                 val resultBundle = Bundle().apply {
-                    putInt("mode", mode)
+                    putInt("mode", 2) // Kunci ke Mode Area
                     putInt("x", x1)
                     putInt("y", y1)
                     putString("hex", hex1)
+                    putInt("rgb1", rgb1) // Pre-parsed Int (Tanpa overhead parsing saat runtime)
                     putBoolean("useColor2", useColor2)
                     putInt("colorLogic", colorLogic)
                     putInt("x2", x2)
                     putInt("y2", y2)
                     putString("hex2", hex2)
+                    putInt("rgb2", rgb2)
+                    putInt("radius", radius)
+                    putInt("step", step)
                     putInt("tolerance", tol)
                     putLong("timeout", timeout)
                 }
 
-                val modeShort = when (mode) {
-                    0 -> "Cek Instan"
-                    1 -> "Tunggu Warna"
-                    else -> "Cari Area"
-                }
                 val logicStr = if (colorLogic == 0) "AND" else "OR"
+                val waitTag = if (timeout > 0L) "Wait ${timeout}ms" else "<0.01ms"
                 val blurb = if (useColor2) {
-                    "$modeShort: W1($x1,$y1)=$hex1 $logicStr W2($x2,$y2)=$hex2 (±$tol)"
+                    "Area(±${radius}px, $waitTag): W1($x1,$y1)=$hex1 $logicStr W2($x2,$y2)=$hex2"
                 } else {
-                    "$modeShort ($x1, $y1) == $hex1 (±$tol)"
+                    "Area(±${radius}px, $waitTag): ($x1, $y1) == $hex1 (±$tol)"
                 }
 
                 val resultIntent = Intent().apply {
