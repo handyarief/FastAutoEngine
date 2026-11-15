@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit
 class FastAccessibilityService : AccessibilityService() {
 
     companion object {
+        @Volatile
         var instance: FastAccessibilityService? = null
         private val screenshotExecutor = Executors.newSingleThreadExecutor()
         @Volatile
@@ -91,17 +92,11 @@ class FastAccessibilityService : AccessibilityService() {
         }
 
         @SuppressLint("NewApi")
-        fun getStealthPixelRgbInt(x: Int, y: Int): Int? {
-            return getStealthTwoPixelsRgbInt(x, y, -1, -1).first
-        }
+        fun getStealthPixelHex(x: Int, y: Int): String? {
+            val service = instance ?: return null
+            if (Build.VERSION.SDK_INT < 30) return null
 
-        @SuppressLint("NewApi")
-        fun getStealthTwoPixelsRgbInt(x1: Int, y1: Int, x2: Int, y2: Int): Pair<Int?, Int?> {
-            val service = instance ?: return Pair(null, null)
-            if (Build.VERSION.SDK_INT < 30) return Pair(null, null)
-
-            var rgb1: Int? = null
-            var rgb2: Int? = null
+            var rgbResult: Int? = null
             val latch = CountDownLatch(1)
 
             try {
@@ -112,18 +107,95 @@ class FastAccessibilityService : AccessibilityService() {
                         override fun onSuccess(screenshotResult: ScreenshotResult) {
                             val hwBuffer = screenshotResult.hardwareBuffer
                             try {
-                                val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
-                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
+                                val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
+                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, srgb)
                                 if (hwBitmap != null) {
-                                    val softBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                                    if (softBitmap != null) {
-                                        if (x1 in 0 until softBitmap.width && y1 in 0 until softBitmap.height) {
-                                            rgb1 = softBitmap.getPixel(x1, y1) and 0xFFFFFF
+                                    if (x in 0 until hwBitmap.width && y in 0 until hwBitmap.height) {
+                                        // Hanya potong 1x1 piksel agar hemat 99.9% RAM dibanding salin layar penuh
+                                        val pixelBmp = Bitmap.createBitmap(hwBitmap, x, y, 1, 1)
+                                        val softBmp = pixelBmp.copy(Bitmap.Config.ARGB_8888, false)
+                                        if (softBmp != null) {
+                                            rgbResult = softBmp.getPixel(0, 0) and 0xFFFFFF
+                                            softBmp.recycle()
                                         }
-                                        if (x2 in 0 until softBitmap.width && y2 in 0 until softBitmap.height) {
-                                            rgb2 = softBitmap.getPixel(x2, y2) and 0xFFFFFF
+                                        pixelBmp.recycle()
+                                    }
+                                    hwBitmap.recycle()
+                                }
+                            } catch (_: Throwable) {
+                            } finally {
+                                try { hwBuffer.close() } catch (_: Throwable) {}
+                                latch.countDown()
+                            }
+                        }
+
+                        override fun onFailure(errorCode: Int) {
+                            latch.countDown()
+                        }
+                    }
+                )
+                latch.await(300, TimeUnit.MILLISECONDS)
+            } catch (_: Throwable) {
+            }
+            val rgb = rgbResult ?: return null
+            return String.format("#%06X", rgb)
+        }
+
+        @SuppressLint("NewApi")
+        fun scanStealthAreaRgb(
+            centerX: Int,
+            centerY: Int,
+            radius: Int,
+            step: Int,
+            targetRgb: Int,
+            tolerance: Int
+        ): Boolean {
+            val service = instance ?: return false
+            if (Build.VERSION.SDK_INT < 30) return false
+
+            var matched = false
+            val latch = CountDownLatch(1)
+
+            try {
+                service.takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    screenshotExecutor,
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshotResult: ScreenshotResult) {
+                            val hwBuffer = screenshotResult.hardwareBuffer
+                            try {
+                                // Kunci ke sRGB agar 100% akurat & identik dengan MediaProjection
+                                val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
+                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, srgb)
+                                if (hwBitmap != null) {
+                                    val left = (centerX - radius).coerceAtLeast(0)
+                                    val top = (centerY - radius).coerceAtLeast(0)
+                                    val right = (centerX + radius).coerceAtMost(hwBitmap.width - 1)
+                                    val bottom = (centerY + radius).coerceAtMost(hwBitmap.height - 1)
+                                    val cropW = right - left + 1
+                                    val cropH = bottom - top + 1
+
+                                    if (cropW > 0 && cropH > 0) {
+                                        // Hanya salin kotak area target (bukan layar penuh) agar dingin & hemat RAM
+                                        val subHw = Bitmap.createBitmap(hwBitmap, left, top, cropW, cropH)
+                                        val softBmp = subHw.copy(Bitmap.Config.ARGB_8888, false)
+                                        if (softBmp != null) {
+                                            val pixels = IntArray(cropW * cropH)
+                                            softBmp.getPixels(pixels, 0, cropW, 0, 0, cropW, cropH)
+
+                                            outer@ for (dy in 0 until cropH step step) {
+                                                val rowOffset = dy * cropW
+                                                for (dx in 0 until cropW step step) {
+                                                    val rgb = pixels[rowOffset + dx] and 0xFFFFFF
+                                                    if (ScreenCaptureService.compareRgbInt(rgb, targetRgb, tolerance)) {
+                                                        matched = true
+                                                        break@outer
+                                                    }
+                                                }
+                                            }
+                                            softBmp.recycle()
                                         }
-                                        softBitmap.recycle()
+                                        subHw.recycle()
                                     }
                                     hwBitmap.recycle()
                                 }
@@ -142,86 +214,7 @@ class FastAccessibilityService : AccessibilityService() {
                 latch.await(320, TimeUnit.MILLISECONDS)
             } catch (_: Throwable) {
             }
-            return Pair(rgb1, rgb2)
-        }
-
-        @SuppressLint("NewApi")
-        fun getStealthPixelHex(x: Int, y: Int): String? {
-            val rgb = getStealthPixelRgbInt(x, y) ?: return null
-            return String.format("#%06X", rgb and 0xFFFFFF)
-        }
-
-        @SuppressLint("NewApi")
-        fun scanStealthArea(
-            centerX: Int,
-            centerY: Int,
-            radius: Int,
-            step: Int,
-            targetHex: String,
-            tolerance: Int
-        ): Pair<Int, Int>? {
-            val service = instance ?: return null
-            if (Build.VERSION.SDK_INT < 30) return null
-
-            var hitPoint: Pair<Int, Int>? = null
-            val latch = CountDownLatch(1)
-            val targetRgb = ScreenCaptureService.parseHexToInt(targetHex)
-
-            try {
-                service.takeScreenshot(
-                    Display.DEFAULT_DISPLAY,
-                    screenshotExecutor,
-                    object : TakeScreenshotCallback {
-                        override fun onSuccess(screenshotResult: ScreenshotResult) {
-                            val hwBuffer = screenshotResult.hardwareBuffer
-                            try {
-                                val cs = screenshotResult.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
-                                val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
-                                if (hwBitmap != null) {
-                                    val softBmp = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                                    if (softBmp != null) {
-                                        val left = (centerX - radius).coerceAtLeast(0)
-                                        val top = (centerY - radius).coerceAtLeast(0)
-                                        val right = (centerX + radius).coerceAtMost(softBmp.width - 1)
-                                        val bottom = (centerY + radius).coerceAtMost(softBmp.height - 1)
-                                        val cropW = right - left + 1
-                                        val cropH = bottom - top + 1
-
-                                        if (cropW > 0 && cropH > 0) {
-                                            val pixels = IntArray(cropW * cropH)
-                                            softBmp.getPixels(pixels, 0, cropW, left, top, cropW, cropH)
-
-                                            outer@ for (dy in 0 until cropH step step) {
-                                                val rowOffset = dy * cropW
-                                                for (dx in 0 until cropW step step) {
-                                                    val rgb = pixels[rowOffset + dx] and 0xFFFFFF
-                                                    if (ScreenCaptureService.compareRgbInt(rgb, targetRgb, tolerance)) {
-                                                        hitPoint = Pair(left + dx, top + dy)
-                                                        break@outer
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        softBmp.recycle()
-                                    }
-                                    hwBitmap.recycle()
-                                }
-                            } catch (_: Throwable) {
-                            } finally {
-                                try { hwBuffer.close() } catch (_: Throwable) {}
-                                latch.countDown()
-                            }
-                        }
-
-                        override fun onFailure(errorCode: Int) {
-                            latch.countDown()
-                        }
-                    }
-                )
-                latch.await(350, TimeUnit.MILLISECONDS)
-            } catch (_: Throwable) {
-            }
-            return hitPoint
+            return matched
         }
     }
 
@@ -232,12 +225,9 @@ class FastAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        val type = event.eventType
-        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-        ) return
+        // HANYA periksa saat jendela baru muncul (STATE_CHANGED), abaikan CONTENT_CHANGED agar 0% lag CPU!
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
 
-        // Hanya periksa popup peringatan jika event berasal dari komponen sistem/keamanan
         val pkg = event.packageName?.toString()?.lowercase() ?: ""
         if (pkg.isNotEmpty() &&
             !pkg.contains("systemui") &&
@@ -254,13 +244,13 @@ class FastAccessibilityService : AccessibilityService() {
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastDismissTime < 250L) return
+        if (now - lastDismissTime < 300L) return
 
         try {
             val root = rootInActiveWindow ?: return
 
             val hasRiskWarning = !root.findAccessibilityNodeInfosByText("Risk screen sharing").isNullOrEmpty() ||
-                                 !root.findAccessibilityNodeInfosByText("Potential Telecom Fraud").isNullOrEmpty()
+                    !root.findAccessibilityNodeInfosByText("Potential Telecom Fraud").isNullOrEmpty()
 
             if (hasRiskWarning) {
                 val closeNodes = root.findAccessibilityNodeInfosByText("Close")
