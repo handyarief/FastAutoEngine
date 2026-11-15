@@ -18,12 +18,16 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.*
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
@@ -47,7 +51,6 @@ class MainActivity : AppCompatActivity() {
     private var cParamsRef: WindowManager.LayoutParams? = null
     private val crosshairSizePx = 96
 
-    // Offset otomatis jika sistem tetap memberi pergeseran inset pada perangkat tertentu
     private var statusOffsetX = 0
     private var statusOffsetY = 0
 
@@ -67,7 +70,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "⚡ FastAuto Color Plugin"
+            text = "⚡ FastAuto Area Color Plugin"
             textSize = 24f
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 12)
@@ -75,7 +78,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pendeteksi 2 Warna < 2ms untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad (Atas/Bawah/Kiri/Kanan) untuk mengepaskan titik piksel secara presisi."
+            text = "Mesin Pemindai Area Sekitar (< 0.01ms, Zero-Lag & Dingin) untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad untuk menentukan titik pusat area pencarian warna."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -90,12 +93,12 @@ class MainActivity : AppCompatActivity() {
         }
         mainLayout.addView(statusText)
 
-        mainLayout.addView(createButton("1. Aktifkan Mesin Baca Warna (Wajib)", "#8E24AA") {
+        mainLayout.addView(createButton("1. Aktifkan Mesin Area RAM (Wajib)", "#8E24AA") {
             val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             startActivityForResult(mpManager.createScreenCaptureIntent(), 1001)
         })
 
-        mainLayout.addView(createButton("2. Munculkan Alat Bidik + Joystick (🎯)", "#00897B") {
+        mainLayout.addView(createButton("2. Munculkan Alat Bidik Pusat Area (🎯)", "#00897B") {
             if (!Settings.canDrawOverlays(this)) {
                 val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                 startActivityForResult(intent, 1002)
@@ -125,10 +128,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
-        statusText.text = "Mesin Baca Warna RAM: ${if (colorOk) "✅ AKTIF (Siap dipakai Automate)" else "❌ MATI"}"
+        statusText.text = "Mesin Area RAM: ${if (colorOk) "✅ AKTIF (<0.01ms Siap Dipakai Automate)" else "❌ MATI"}"
     }
 
     private fun removeAllOverlays() {
+        ScreenCaptureService.isPickerOverlayOpen = false
         stopRepeatMove()
         delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -137,9 +141,6 @@ class MainActivity : AppCompatActivity() {
         dpadView?.let { try { wm.removeView(it) } catch (_: Exception) {}; dpadView = null }
     }
 
-    /**
-     * Membaca posisi fisik sesungguhnya dari titik tengah lubang Crosshair di layar penuh (termasuk Status Bar & Cutout)
-     */
     private fun syncAndRefreshFromCrosshair() {
         val target = crosshairView ?: return
         target.post {
@@ -156,7 +157,6 @@ class MainActivity : AppCompatActivity() {
             val trueCenterY = loc[1] + (target.height / 2)
             refreshColorAt(trueCenterX, trueCenterY)
 
-            // Baca ulang setelah frame baru MediaProjection dirender (45ms kemudian)
             delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
             delayedSampleRunnable = Runnable {
                 val locAfter = IntArray(2)
@@ -165,15 +165,27 @@ class MainActivity : AppCompatActivity() {
                 val cy = locAfter[1] + (target.height / 2)
                 refreshColorAt(cx, cy)
             }
-            uiHandler.postDelayed(delayedSampleRunnable!!, 45L)
+            uiHandler.postDelayed(delayedSampleRunnable!!, 40L)
         }
     }
 
-    private fun refreshColorAt(x: Int, y: Int) {
-        val maxW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
-        val maxH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
-        lastPickedX = x.coerceIn(0, maxW - 1)
-        lastPickedY = y.coerceIn(0, maxH - 1)
+    private fun refreshColorAt(rawX: Int, rawY: Int) {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        val physW = metrics.widthPixels.coerceAtLeast(1)
+        val physH = metrics.heightPixels.coerceAtLeast(1)
+
+        val bufW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
+        val bufH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
+
+        // Kalibrasi skala 1:1 antara layar fisik dan ImageReader buffer
+        val calibratedX = ((rawX.toLong() * bufW) / physW).toInt().coerceIn(0, bufW - 1)
+        val calibratedY = ((rawY.toLong() * bufH) / physH).toInt().coerceIn(0, bufH - 1)
+
+        lastPickedX = calibratedX
+        lastPickedY = calibratedY
 
         val hex = ScreenCaptureService.getPixelHex(lastPickedX, lastPickedY)
             ?: FastAccessibilityService.getStealthPixelHex(lastPickedX, lastPickedY)
@@ -195,7 +207,6 @@ class MainActivity : AppCompatActivity() {
         val maxW = ScreenCaptureService.screenWidth.coerceAtLeast(1080)
         val maxH = ScreenCaptureService.screenHeight.coerceAtLeast(1920)
 
-        // Ambil posisi layar fisik saat ini lalu geser sejauh dx, dy
         val loc = IntArray(2)
         target.getLocationOnScreen(loc)
         val currentScreenX = loc[0] + (target.width / 2)
@@ -204,7 +215,6 @@ class MainActivity : AppCompatActivity() {
         val nextScreenX = (currentScreenX + dx).coerceIn(0, maxW - 1)
         val nextScreenY = (currentScreenY + dy).coerceIn(0, maxH - 1)
 
-        // Konversi balik ke koordinat WindowManager dengan mengkompensasi offset sistem (jika ada)
         cParams.x = nextScreenX - (crosshairSizePx / 2) - statusOffsetX
         cParams.y = nextScreenY - (crosshairSizePx / 2) - statusOffsetY
 
@@ -223,6 +233,9 @@ class MainActivity : AppCompatActivity() {
     private fun showFloatingPicker() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (floatingView != null) return
+
+        ScreenCaptureService.isPickerOverlayOpen = true
+        ScreenCaptureService.updatePickerTarget(lastPickedX, lastPickedY)
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -309,7 +322,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val saveBtn1 = TextView(this).apply {
-            text = "🎯 Warna 1"
+            text = "🎯 Area 1"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
             setTypeface(null, Typeface.BOLD)
@@ -331,12 +344,12 @@ class MainActivity : AppCompatActivity() {
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("color1", lastPickedHex))
-                Toast.makeText(this@MainActivity, "W1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Area 1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
         val saveBtn2 = TextView(this).apply {
-            text = "🎯 Warna 2"
+            text = "🎯 Area 2"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
             setTypeface(null, Typeface.BOLD)
@@ -358,7 +371,7 @@ class MainActivity : AppCompatActivity() {
                     .apply()
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("color2", lastPickedHex))
-                Toast.makeText(this@MainActivity, "W2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Area 2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -545,7 +558,6 @@ class MainActivity : AppCompatActivity() {
                         try {
                             wm.updateViewLayout(targetViewToUpdate, layoutParams)
                         } catch (_: Exception) {}
-                        // Segarkan juga bacaan warna bila panel digeser menjauh dari crosshair
                         syncAndRefreshFromCrosshair()
                         return true
                     }
@@ -578,7 +590,6 @@ class MainActivity : AppCompatActivity() {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                // Lubang tengah dibuat berjarak 12px dari titik pusat agar anti-aliasing garis tidak pernah mengotori piksel tengah
                 canvas.drawCircle(cx, cy, 30f, paintOuter)
                 canvas.drawCircle(cx, cy, 30f, paintRing)
 
@@ -589,11 +600,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // KUNCI UTAMA AKURASI: Gunakan FLAG_LAYOUT_IN_SCREEN + FLAG_LAYOUT_NO_LIMITS + CUTOUT_MODE_ALWAYS
-        // agar sistem koordinat (0,0) WindowManager sama persis dengan pojok kiri-atas layar fisik MediaProjection
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
         val cParams = WindowManager.LayoutParams(
             sizePx,
