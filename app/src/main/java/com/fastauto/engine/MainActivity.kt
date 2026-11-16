@@ -585,7 +585,6 @@ class MainActivity : AppCompatActivity() {
     private fun showHollowCrosshair(wm: WindowManager) {
         val sizePx = crosshairSizePx
         val target = object : View(this) {
-            // Menggunakan warna Kuning & Hijau Neon (Bukan Hitam/Merah) agar tidak pernah mengganggu deteksi teks hitam/merah!
             private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.YELLOW
                 style = Paint.Style.STROKE
@@ -601,7 +600,6 @@ class MainActivity : AppCompatActivity() {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                // Biarkan radius 25px di sekitar titik tengah 100% kosong melompong
                 canvas.drawCircle(cx, cy, 28f, paintRing)
 
                 canvas.drawLine(0f, cy, cx - 22f, cy, paintLine)
@@ -664,7 +662,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode: Int, resultCode: Int, data: Intent?)
+        super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 1001 && resultCode == Activity.RESULT_OK && data != null) {
             val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
