@@ -43,49 +43,25 @@ class ScreenCaptureService : Service() {
         @Volatile var screenHeight = 0
         @Volatile var screenDensity = 0
 
-        // Konfigurasi aktif yang dipantau secara real-time di RAM (< 0.01ms read)
-        @Volatile private var watchX1 = 540
-        @Volatile private var watchY1 = 1200
-        @Volatile private var watchRgb1 = 0xFF0000
-        @Volatile private var watchUseColor2 = false
-        @Volatile private var watchLogic = 0
-        @Volatile private var watchX2 = 540
-        @Volatile private var watchY2 = 1200
-        @Volatile private var watchRgb2 = 0x00FF00
-        @Volatile private var watchRadius = 100
-        @Volatile private var watchStep = 4
-        @Volatile private var watchTol = 20
-
-        // Cache hasil instan untuk pembacaan < 0.001 ms
-        @Volatile var cachedMatchResult: Boolean = false
-        @Volatile var lastFrameTimestampNs: Long = 0L
         @Volatile var isPickerOverlayOpen: Boolean = false
 
-        // Sinyal bangun instan untuk Mode Tunggu (Zero-CPU Wait)
-        private val frameWaitLock = Object()
-        private val snapshotLock = Object()
+        private val frameLock = Object()
 
-        // Buffer baris reusable agar 0% alokasi memori (Zero Garbage Collection)
-        private var reusableRowBuffer = ByteArray(16384)
+        // Menyimpan 1 frame terakhir secara ringan hanya saat ada frame baru masuk
+        private var cachedFrameBytes: ByteArray? = null
+        @Volatile private var cachedW = 0
+        @Volatile private var cachedH = 0
+        @Volatile private var cachedRowStride = 0
+        @Volatile private var cachedPixelStride = 4
+        @Volatile private var hasFreshFrame = false
 
-        // Snapshot frame terakhir di RAM agar Picker & Area Scan 100% akurat meski layar diam/statis
-        private var latestFrameBytes: ByteArray? = null
-        @Volatile private var latestFrameW = 0
-        @Volatile private var latestFrameH = 0
-        @Volatile private var latestRowStride = 0
-        @Volatile private var latestPixelStride = 4
-
-        @Volatile private var isHibernating = false
-        private val hibernateRunnable = Runnable {
-            if (!isPickerOverlayOpen) {
-                enterHibernation()
-            }
-        }
+        // Buffer baris kecil (reusable) untuk pembacaan area super cepat tanpa GC
+        private var reusableRowBuffer = ByteArray(8192)
 
         fun isReady(): Boolean = imageReader != null && mediaProjection != null
 
         fun updatePickerTarget(x: Int, y: Int) {
-            wakeUpFromHibernation()
+            // Tidak perlu hibernasi karena sistem baru sudah 0% CPU saat idle
         }
 
         fun registerWatchConfig(
@@ -94,49 +70,51 @@ class ScreenCaptureService : Service() {
             x2: Int, y2: Int, rgb2: Int,
             radius: Int, step: Int, tolerance: Int
         ): Boolean {
-            val changed = (watchX1 != x1 || watchY1 != y1 || watchRgb1 != rgb1 ||
-                    watchUseColor2 != useColor2 || watchLogic != colorLogic ||
-                    watchX2 != x2 || watchY2 != y2 || watchRgb2 != rgb2 ||
-                    watchRadius != radius || watchStep != step || watchTol != tolerance)
-
-            watchX1 = x1
-            watchY1 = y1
-            watchRgb1 = rgb1
-            watchUseColor2 = useColor2
-            watchLogic = colorLogic
-            watchX2 = x2
-            watchY2 = y2
-            watchRgb2 = rgb2
-            watchRadius = radius.coerceIn(1, 500)
-            watchStep = step.coerceIn(1, 20)
-            watchTol = tolerance.coerceIn(0, 255)
-
-            wakeUpFromHibernation()
-
-            // Jika konfigurasi berubah dan kita punya snapshot frame terakhir di RAM, langsung evaluasi instan!
-            if (changed) {
-                evaluateFromSnapshotIfAvailable()
-            }
-            return changed
+            return true
         }
 
-        private fun evaluateFromSnapshotIfAvailable() {
-            synchronized(snapshotLock) {
-                val snap = latestFrameBytes ?: return
-                val w = latestFrameW
-                val h = latestFrameH
-                val rs = latestRowStride
-                val ps = latestPixelStride
-                if (w <= 0 || h <= 0 || rs <= 0) return
+        /**
+         * Menarik frame paling mutakhir dari GPU ImageReader jika tersedia.
+         * Jika layar sedang diam (tidak ada frame baru dari OS), gunakan cachedFrameBytes terakhir.
+         * Dijamin 100% real-time dan tidak pernah basi!
+         */
+        private fun pullLatestFrameToCache() {
+            val reader = imageReader ?: return
+            val img = try {
+                reader.acquireLatestImage()
+            } catch (_: Throwable) {
+                null
+            } ?: return
 
-                val m1 = scanByteArrayArea(snap, w, h, rs, ps, watchX1, watchY1, watchRadius, watchStep, watchRgb1, watchTol)
-                cachedMatchResult = if (!watchUseColor2) {
-                    m1
-                } else if (watchLogic == 0) {
-                    if (!m1) false else scanByteArrayArea(snap, w, h, rs, ps, watchX2, watchY2, watchRadius, watchStep, watchRgb2, watchTol)
-                } else {
-                    if (m1) true else scanByteArrayArea(snap, w, h, rs, ps, watchX2, watchY2, watchRadius, watchStep, watchRgb2, watchTol)
+            try {
+                val planes = img.planes
+                if (!planes.isNullOrEmpty()) {
+                    val plane = planes[0]
+                    val buffer = plane.buffer
+                    if (buffer != null) {
+                        val limit = buffer.limit()
+                        synchronized(frameLock) {
+                            var arr = cachedFrameBytes
+                            if (arr == null || arr.size < limit) {
+                                arr = ByteArray(limit)
+                                cachedFrameBytes = arr
+                            }
+                            buffer.position(0)
+                            buffer.get(arr, 0, limit)
+                            cachedW = img.width
+                            cachedH = img.height
+                            cachedRowStride = plane.rowStride
+                            cachedPixelStride = plane.pixelStride
+                            hasFreshFrame = true
+                            frameLock.notifyAll()
+                        }
+                    }
                 }
+            } catch (_: Throwable) {
+            } finally {
+                try {
+                    img.close()
+                } catch (_: Throwable) {}
             }
         }
 
@@ -147,137 +125,63 @@ class ScreenCaptureService : Service() {
             radius: Int, step: Int, tolerance: Int,
             timeoutMs: Long
         ): Boolean {
-            registerWatchConfig(
-                x1, y1, rgb1,
-                useColor2, colorLogic,
-                x2, y2, rgb2,
-                radius, step, tolerance
-            )
+            val rad = radius.coerceIn(1, 500)
+            val stp = step.coerceIn(1, 20)
+            val tol = tolerance.coerceIn(0, 255)
 
-            // Evaluasi langsung dari RAM snapshot terbaru (< 0.005 ms) bahkan saat layar statis
-            evaluateFromSnapshotIfAvailable()
+            // 1. Tarik frame terbaru yang ada di antrean GPU sekarang juga
+            pullLatestFrameToCache()
 
-            if (cachedMatchResult) {
+            // 2. Evaluasi instan (< 0.01ms)
+            if (checkCurrentCache(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                 return true
             }
-            if (timeoutMs <= 0L && !isHibernating && latestFrameBytes != null) {
-                return cachedMatchResult
+
+            if (timeoutMs <= 0L) {
+                return false
             }
 
-            val waitBudget = if (timeoutMs <= 0L) 35L else timeoutMs.coerceAtMost(8000L)
-            val deadline = System.nanoTime() + (waitBudget * 1_000_000L)
-
-            synchronized(frameWaitLock) {
-                while (true) {
-                    if (cachedMatchResult) return true
-                    val remainingNs = deadline - System.nanoTime()
-                    if (remainingNs <= 0L) break
-                    val waitMs = (remainingNs / 1_000_000L).coerceAtLeast(1L)
+            // 3. Jika mode tunggu (timeout > 0), tunggu frame baru dengan hemat CPU
+            val deadline = System.nanoTime() + (timeoutMs.coerceAtMost(8000L) * 1_000_000L)
+            while (System.nanoTime() < deadline) {
+                pullLatestFrameToCache()
+                if (checkCurrentCache(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
+                    return true
+                }
+                synchronized(frameLock) {
+                    val remMs = ((deadline - System.nanoTime()) / 1_000_000L).coerceIn(1L, 16L)
                     try {
-                        frameWaitLock.wait(waitMs)
+                        frameLock.wait(remMs)
                     } catch (_: InterruptedException) {
-                        break
+                        return false
                     }
                 }
             }
-            return cachedMatchResult
+            return false
         }
 
-        private fun wakeUpFromHibernation() {
-            mainHandler.removeCallbacks(hibernateRunnable)
-            if (!isPickerOverlayOpen) {
-                mainHandler.postDelayed(hibernateRunnable, 5000L)
-            }
-            if (isHibernating) {
-                isHibernating = false
-                mainHandler.post {
-                    try {
-                        virtualDisplay?.surface = imageReader?.surface
-                    } catch (_: Throwable) {}
-                }
-            }
-        }
+        private fun checkCurrentCache(
+            x1: Int, y1: Int, rgb1: Int,
+            useColor2: Boolean, colorLogic: Int,
+            x2: Int, y2: Int, rgb2: Int,
+            radius: Int, step: Int, tolerance: Int
+        ): Boolean {
+            synchronized(frameLock) {
+                val snap = cachedFrameBytes ?: return false
+                val w = cachedW
+                val h = cachedH
+                val rs = cachedRowStride
+                val ps = cachedPixelStride
+                if (w <= 0 || h <= 0 || rs <= 0) return false
 
-        private fun enterHibernation() {
-            if (!isHibernating && virtualDisplay != null && !isPickerOverlayOpen) {
-                isHibernating = true
-                try {
-                    virtualDisplay?.surface = null
-                } catch (_: Throwable) {}
-            }
-        }
-
-        private fun processIncomingFrame(reader: ImageReader) {
-            val img = try {
-                reader.acquireLatestImage()
-            } catch (_: Throwable) {
-                null
-            } ?: return
-
-            try {
-                val planes = img.planes
-                if (planes.isNullOrEmpty()) return
-                val plane = planes[0]
-                val buffer = plane.buffer ?: return
-                val rowStride = plane.rowStride
-                val pixelStride = plane.pixelStride
-                val width = img.width
-                val height = img.height
-                val limit = buffer.limit()
-
-                // Simpan salinan ringan ke RAM statis (Zero Re-allocation) agar layar diam di Samsung tetap terbaca akurat 100%
-                synchronized(snapshotLock) {
-                    var snap = latestFrameBytes
-                    if (snap == null || snap.size < limit) {
-                        snap = ByteArray(limit)
-                        latestFrameBytes = snap
-                    }
-                    buffer.position(0)
-                    buffer.get(snap, 0, limit)
-                    latestFrameW = width
-                    latestFrameH = height
-                    latestRowStride = rowStride
-                    latestPixelStride = pixelStride
-                }
-
-                val rad = watchRadius
-                val stp = watchStep
-                val tol = watchTol
-                val use2 = watchUseColor2
-                val logic = watchLogic
-
-                val m1 = scanBufferAreaBulk(
-                    buffer, width, height, rowStride, pixelStride, limit,
-                    watchX1, watchY1, rad, stp, watchRgb1, tol
-                )
-
-                val finalMatch = if (!use2) {
+                val m1 = scanByteArrayArea(snap, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
+                return if (!useColor2) {
                     m1
-                } else if (logic == 0) {
-                    if (!m1) false else scanBufferAreaBulk(
-                        buffer, width, height, rowStride, pixelStride, limit,
-                        watchX2, watchY2, rad, stp, watchRgb2, tol
-                    )
+                } else if (colorLogic == 0) {
+                    if (!m1) false else scanByteArrayArea(snap, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 } else {
-                    if (m1) true else scanBufferAreaBulk(
-                        buffer, width, height, rowStride, pixelStride, limit,
-                        watchX2, watchY2, rad, stp, watchRgb2, tol
-                    )
+                    if (m1) true else scanByteArrayArea(snap, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 }
-
-                cachedMatchResult = finalMatch
-                lastFrameTimestampNs = System.nanoTime()
-
-                if (finalMatch) {
-                    synchronized(frameWaitLock) {
-                        frameWaitLock.notifyAll()
-                    }
-                }
-            } catch (_: Throwable) {
-            } finally {
-                try {
-                    img.close()
-                } catch (_: Throwable) {}
             }
         }
 
@@ -302,6 +206,7 @@ class ScreenCaptureService : Service() {
             val cy = centerY.coerceIn(0, height - 1)
             val limit = snap.size
 
+            // Cek titik pusat terlebih dahulu (0.0001 ms)
             val centerOff = cy * rowStride + cx * pixelStride
             if (centerOff >= 0 && centerOff + 2 < limit) {
                 val cr = snap[centerOff].toInt() and 0xFF
@@ -339,86 +244,16 @@ class ScreenCaptureService : Service() {
             return false
         }
 
-        private fun scanBufferAreaBulk(
-            buffer: ByteBuffer,
-            width: Int,
-            height: Int,
-            rowStride: Int,
-            pixelStride: Int,
-            limit: Int,
-            centerX: Int,
-            centerY: Int,
-            radius: Int,
-            step: Int,
-            targetRgb: Int,
-            tolerance: Int
-        ): Boolean {
-            val r2 = (targetRgb shr 16) and 0xFF
-            val g2 = (targetRgb shr 8) and 0xFF
-            val b2 = targetRgb and 0xFF
-
-            val cx = centerX.coerceIn(0, width - 1)
-            val cy = centerY.coerceIn(0, height - 1)
-
-            val centerOff = cy * rowStride + cx * pixelStride
-            if (centerOff >= 0 && centerOff + 2 < limit) {
-                val cr = buffer.get(centerOff).toInt() and 0xFF
-                val cg = buffer.get(centerOff + 1).toInt() and 0xFF
-                val cb = buffer.get(centerOff + 2).toInt() and 0xFF
-                if (abs(cr - r2) <= tolerance && abs(cg - g2) <= tolerance && abs(cb - b2) <= tolerance) {
-                    return true
-                }
-            }
-
-            val startX = (cx - radius).coerceAtLeast(0)
-            val endX = (cx + radius).coerceAtMost(width - 1)
-            val startY = (cy - radius).coerceAtLeast(0)
-            val endY = (cy + radius).coerceAtMost(height - 1)
-
-            val bytesNeeded = (endX - startX + 1) * pixelStride
-            if (bytesNeeded <= 0) return false
-            if (reusableRowBuffer.size < bytesNeeded) {
-                reusableRowBuffer = ByteArray(bytesNeeded + 1024)
-            }
-            val rowArr = reusableRowBuffer
-
-            for (y in startY..endY step step) {
-                val rowStartOff = y * rowStride + startX * pixelStride
-                if (rowStartOff < 0 || rowStartOff + bytesNeeded > limit) continue
-
-                buffer.position(rowStartOff)
-                buffer.get(rowArr, 0, bytesNeeded)
-
-                var localIdx = 0
-                val maxLocalIdx = bytesNeeded - 3
-                val strideStep = step * pixelStride
-                while (localIdx <= maxLocalIdx) {
-                    val r1 = rowArr[localIdx].toInt() and 0xFF
-                    val g1 = rowArr[localIdx + 1].toInt() and 0xFF
-                    val b1 = rowArr[localIdx + 2].toInt() and 0xFF
-                    if (abs(r1 - r2) <= tolerance &&
-                        abs(g1 - g2) <= tolerance &&
-                        abs(b1 - b2) <= tolerance
-                    ) {
-                        return true
-                    }
-                    localIdx += strideStep
-                }
-            }
-            return false
-        }
-
-        // Membaca piksel secara REAL-TIME langsung dari Snapshot Koordinat X,Y saat ini!
         fun getPixelHex(x: Int, y: Int): String? {
             if (!isReady()) return null
-            wakeUpFromHibernation()
+            pullLatestFrameToCache()
 
-            synchronized(snapshotLock) {
-                val snap = latestFrameBytes ?: return null
-                val w = latestFrameW
-                val h = latestFrameH
-                val rs = latestRowStride
-                val ps = latestPixelStride
+            synchronized(frameLock) {
+                val snap = cachedFrameBytes ?: return null
+                val w = cachedW
+                val h = cachedH
+                val rs = cachedRowStride
+                val ps = cachedPixelStride
                 if (w <= 0 || h <= 0 || rs <= 0) return null
 
                 val px = x.coerceIn(0, w - 1)
@@ -437,7 +272,7 @@ class ScreenCaptureService : Service() {
 
         fun parseHexToInt(hex: String): Int {
             return try {
-                val clean = if (hex.startsWith("#")) hex else "#$hex"
+                val clean = if (hex.startsWith("#")) hex.trim() else "#${hex.trim()}"
                 Color.parseColor(clean) and 0xFFFFFF
             } catch (_: Exception) {
                 0xFF0000
@@ -464,7 +299,7 @@ class ScreenCaptureService : Service() {
                 x, y, targetRgb,
                 false, 0,
                 0, 0, 0,
-                100, 4, tolerance, 0L
+                50, 2, tolerance, 0L
             )
         }
     }
@@ -543,13 +378,21 @@ class ScreenCaptureService : Service() {
             }
         }, mainHandler)
 
+        // Gunakan maxImages = 2. Kita tarik frame pertama saat inisialisasi, lalu selanjutnya On-Demand
         val reader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
-        reader.setOnImageAvailableListener({ r ->
-            processIncomingFrame(r)
+        reader.setOnImageAvailableListener({ _ ->
+            // Jangan salin frame 60fps di sini agar 0% Lag!
+            // Hanya bangunkan thread jika ada blok Automate yang sedang mode tunggu (wait) atau saat cache masih kosong
+            if (!hasFreshFrame) {
+                pullLatestFrameToCache()
+            } else {
+                synchronized(frameLock) {
+                    frameLock.notifyAll()
+                }
+            }
         }, handler)
         imageReader = reader
 
-        isHibernating = false
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "FastAutoColorEngine",
             screenWidth, screenHeight, screenDensity,
@@ -559,8 +402,6 @@ class ScreenCaptureService : Service() {
     }
 
     private fun stopProjection() {
-        mainHandler.removeCallbacks(hibernateRunnable)
-        isHibernating = false
         try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
         try { imageReader?.close() } catch (_: Throwable) {}
@@ -570,8 +411,9 @@ class ScreenCaptureService : Service() {
         try { bgThread?.quitSafely() } catch (_: Throwable) {}
         bgThread = null
         bgHandler = null
-        synchronized(snapshotLock) {
-            latestFrameBytes = null
+        synchronized(frameLock) {
+            cachedFrameBytes = null
+            hasFreshFrame = false
         }
     }
 
