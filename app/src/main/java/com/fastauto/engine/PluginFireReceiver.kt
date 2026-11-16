@@ -18,7 +18,7 @@ class PluginFireReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val bundle = intent.getBundleExtra("com.twofortyfouram.locale.intent.extra.BUNDLE")
         if (bundle == null) {
-            resultCode = RESULT_CONDITION_UNSATISFIED
+            if (isOrderedBroadcast) resultCode = RESULT_CONDITION_UNSATISFIED
             return
         }
 
@@ -51,11 +51,11 @@ class PluginFireReceiver : BroadcastReceiver() {
         val stealthReady = FastAccessibilityService.instance != null
 
         if (!ramReady && !stealthReady) {
-            resultCode = RESULT_CONDITION_UNSATISFIED
+            if (isOrderedBroadcast) resultCode = RESULT_CONDITION_UNSATISFIED
             return
         }
 
-        // JALUR SUPER CEPAT (< 0.001 ms Tanpa Alokasi Thread) saat Mesin RAM Siap & Timeout == 0
+        // JALUR SUPER CEPAT (< 0.01 ms Murni Zero-Copy Tanpa Alokasi Thread) saat Mesin RAM Siap & Timeout == 0
         if (ramReady && timeout <= 0L) {
             val matched = ScreenCaptureService.evaluateAreaInstantOrWait(
                 x1, y1, targetRgb1,
@@ -64,11 +64,14 @@ class PluginFireReceiver : BroadcastReceiver() {
                 radius, step, tolerance,
                 0L
             )
-            resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
+            if (isOrderedBroadcast) {
+                resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
+            }
             return
         }
 
         // JALUR TUNGGU FRAME-SYNC ATAU STEALTH CADANGAN (Memakai Reusable Executor)
+        val isOrdered = isOrderedBroadcast
         val pendingResult = goAsync()
         workerExecutor.execute {
             var matched = false
@@ -105,8 +108,12 @@ class PluginFireReceiver : BroadcastReceiver() {
                 }
             } catch (_: Throwable) {
             } finally {
-                pendingResult.resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
-                pendingResult.finish()
+                try {
+                    if (isOrdered) {
+                        pendingResult.resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
+                    }
+                    pendingResult.finish()
+                } catch (_: Throwable) {}
             }
         }
     }
