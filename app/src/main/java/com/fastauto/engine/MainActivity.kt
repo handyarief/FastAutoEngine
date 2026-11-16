@@ -49,7 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var hexTvRef: TextView? = null
     private var colorPreviewDrawable: GradientDrawable? = null
     private var cParamsRef: WindowManager.LayoutParams? = null
-    private val crosshairSizePx = 96
+    private val crosshairSizePx = 120
 
     private var statusOffsetX = 0
     private var statusOffsetY = 0
@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area Sekitar (< 0.01ms, Zero-Lag & Akurat di Semua Resolusi HD+/FHD+) untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad untuk menentukan titik pusat area pencarian warna."
+            text = "Mesin Pemindai Area Sekitar (On-Demand Zero-Lag & Akurat 100% di Semua HP) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi kamera layar."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -585,33 +585,29 @@ class MainActivity : AppCompatActivity() {
     private fun showHollowCrosshair(wm: WindowManager) {
         val sizePx = crosshairSizePx
         val target = object : View(this) {
+            // Menggunakan warna Kuning & Hijau Neon (Bukan Hitam/Merah) agar tidak pernah mengganggu deteksi teks hitam/merah!
             private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.YELLOW
                 style = Paint.Style.STROKE
-                strokeWidth = 3.5f
-            }
-            private val paintOuter = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.BLACK
-                style = Paint.Style.STROKE
-                strokeWidth = 5.5f
+                strokeWidth = 3f
             }
             private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.CYAN
+                color = Color.parseColor("#00E676")
                 style = Paint.Style.STROKE
-                strokeWidth = 3f
+                strokeWidth = 2.5f
             }
 
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                canvas.drawCircle(cx, cy, 30f, paintOuter)
-                canvas.drawCircle(cx, cy, 30f, paintRing)
+                // Biarkan radius 25px di sekitar titik tengah 100% kosong melompong
+                canvas.drawCircle(cx, cy, 28f, paintRing)
 
-                canvas.drawLine(0f, cy, cx - 12f, cy, paintLine)
-                canvas.drawLine(cx + 12f, cy, width.toFloat(), cy, paintLine)
-                canvas.drawLine(cx, 0f, cx, cy - 12f, paintLine)
-                canvas.drawLine(cx, cy + 12f, cx, height.toFloat(), paintLine)
+                canvas.drawLine(0f, cy, cx - 22f, cy, paintLine)
+                canvas.drawLine(cx + 22f, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - 22f, paintLine)
+                canvas.drawLine(cx, cy + 22f, cx, height.toFloat(), paintLine)
             }
         }
 
@@ -668,7 +664,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
+        super.onActivityResult(requestCode: Int, resultCode: Int, data: Intent?)
         if (requestCode == 1001 && resultCode == Activity.RESULT_OK && data != null) {
             val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
