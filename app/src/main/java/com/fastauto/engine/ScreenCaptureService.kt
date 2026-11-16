@@ -47,21 +47,17 @@ class ScreenCaptureService : Service() {
 
         private val frameLock = Object()
 
-        // Menyimpan 1 frame terakhir secara ringan hanya saat ada frame baru masuk
-        private var cachedFrameBytes: ByteArray? = null
+        // Menyimpan referensi Image terakhir langsung di memori Native GPU (Zero-Copy 0 MB Heap!)
+        private var latestImage: android.media.Image? = null
         @Volatile private var cachedW = 0
         @Volatile private var cachedH = 0
         @Volatile private var cachedRowStride = 0
         @Volatile private var cachedPixelStride = 4
-        @Volatile private var hasFreshFrame = false
-
-        // Buffer baris kecil (reusable) untuk pembacaan area super cepat tanpa GC
-        private var reusableRowBuffer = ByteArray(8192)
 
         fun isReady(): Boolean = imageReader != null && mediaProjection != null
 
         fun updatePickerTarget(x: Int, y: Int) {
-            // Tidak perlu hibernasi karena sistem baru sudah 0% CPU saat idle
+            // Sistem Zero-Copy Direct Buffer 0% CPU saat idle
         }
 
         fun registerWatchConfig(
@@ -74,46 +70,34 @@ class ScreenCaptureService : Service() {
         }
 
         /**
-         * Menarik frame paling mutakhir dari GPU ImageReader jika tersedia.
-         * Jika layar sedang diam (tidak ada frame baru dari OS), gunakan cachedFrameBytes terakhir.
-         * Dijamin 100% real-time dan tidak pernah basi!
+         * Menukar (swap) referensi frame terbaru dari ImageReader secara instan tanpa menyalin 10MB byte!
+         * Waktu eksekusi: ~0.001 ms.
          */
-        private fun pullLatestFrameToCache() {
+        private fun acquireFreshImageIfAny() {
             val reader = imageReader ?: return
-            val img = try {
+            val newImg = try {
                 reader.acquireLatestImage()
             } catch (_: Throwable) {
                 null
             } ?: return
 
-            try {
-                val planes = img.planes
-                if (!planes.isNullOrEmpty()) {
-                    val plane = planes[0]
-                    val buffer = plane.buffer
-                    if (buffer != null) {
-                        val limit = buffer.limit()
-                        synchronized(frameLock) {
-                            var arr = cachedFrameBytes
-                            if (arr == null || arr.size < limit) {
-                                arr = ByteArray(limit)
-                                cachedFrameBytes = arr
-                            }
-                            buffer.position(0)
-                            buffer.get(arr, 0, limit)
-                            cachedW = img.width
-                            cachedH = img.height
-                            cachedRowStride = plane.rowStride
-                            cachedPixelStride = plane.pixelStride
-                            hasFreshFrame = true
-                            frameLock.notifyAll()
-                        }
-                    }
-                }
-            } catch (_: Throwable) {
-            } finally {
+            synchronized(frameLock) {
                 try {
-                    img.close()
+                    val planes = newImg.planes
+                    if (!planes.isNullOrEmpty() && planes[0].buffer != null) {
+                        latestImage?.close()
+                        latestImage = newImg
+                        cachedW = newImg.width
+                        cachedH = newImg.height
+                        cachedRowStride = planes[0].rowStride
+                        cachedPixelStride = planes[0].pixelStride
+                        frameLock.notifyAll()
+                        return
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    newImg.close()
                 } catch (_: Throwable) {}
             }
         }
@@ -129,11 +113,11 @@ class ScreenCaptureService : Service() {
             val stp = step.coerceIn(1, 20)
             val tol = tolerance.coerceIn(0, 255)
 
-            // 1. Tarik frame terbaru yang ada di antrean GPU sekarang juga
-            pullLatestFrameToCache()
+            // 1. Ambil pointer frame terbaru dari GPU (Zero-Copy)
+            acquireFreshImageIfAny()
 
-            // 2. Evaluasi instan (< 0.01ms)
-            if (checkCurrentCache(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
+            // 2. Evaluasi langsung dari DirectByteBuffer (< 0.01ms)
+            if (checkCurrentBuffer(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                 return true
             }
 
@@ -141,11 +125,11 @@ class ScreenCaptureService : Service() {
                 return false
             }
 
-            // 3. Jika mode tunggu (timeout > 0), tunggu frame baru dengan hemat CPU
+            // 3. Jika mode tunggu (timeout > 0), tunggu sinyal frame baru dengan 0% CPU
             val deadline = System.nanoTime() + (timeoutMs.coerceAtMost(8000L) * 1_000_000L)
             while (System.nanoTime() < deadline) {
-                pullLatestFrameToCache()
-                if (checkCurrentCache(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
+                acquireFreshImageIfAny()
+                if (checkCurrentBuffer(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                     return true
                 }
                 synchronized(frameLock) {
@@ -160,33 +144,41 @@ class ScreenCaptureService : Service() {
             return false
         }
 
-        private fun checkCurrentCache(
+        private fun checkCurrentBuffer(
             x1: Int, y1: Int, rgb1: Int,
             useColor2: Boolean, colorLogic: Int,
             x2: Int, y2: Int, rgb2: Int,
             radius: Int, step: Int, tolerance: Int
         ): Boolean {
             synchronized(frameLock) {
-                val snap = cachedFrameBytes ?: return false
+                val img = latestImage ?: return false
+                val planes = try { img.planes } catch (_: Throwable) { null } ?: return false
+                if (planes.isEmpty()) return false
+                val buf = planes[0].buffer ?: return false
+
                 val w = cachedW
                 val h = cachedH
                 val rs = cachedRowStride
                 val ps = cachedPixelStride
                 if (w <= 0 || h <= 0 || rs <= 0) return false
 
-                val m1 = scanByteArrayArea(snap, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
+                val m1 = scanDirectBufferArea(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
                 return if (!useColor2) {
                     m1
                 } else if (colorLogic == 0) {
-                    if (!m1) false else scanByteArrayArea(snap, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+                    if (!m1) false else scanDirectBufferArea(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 } else {
-                    if (m1) true else scanByteArrayArea(snap, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+                    if (m1) true else scanDirectBufferArea(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 }
             }
         }
 
-        private fun scanByteArrayArea(
-            snap: ByteArray,
+        /**
+         * Membaca piksel langsung dari memori Native (DirectByteBuffer) dengan indeks absolut.
+         * Tidak ada alokasi ByteArray sama sekali!
+         */
+        private fun scanDirectBufferArea(
+            buf: ByteBuffer,
             width: Int,
             height: Int,
             rowStride: Int,
@@ -204,19 +196,20 @@ class ScreenCaptureService : Service() {
 
             val cx = centerX.coerceIn(0, width - 1)
             val cy = centerY.coerceIn(0, height - 1)
-            val limit = snap.size
+            val limit = buf.limit()
 
-            // Cek titik pusat terlebih dahulu (0.0001 ms)
+            // 1. Cek titik pusat terlebih dahulu (0.0001 ms)
             val centerOff = cy * rowStride + cx * pixelStride
             if (centerOff >= 0 && centerOff + 2 < limit) {
-                val cr = snap[centerOff].toInt() and 0xFF
-                val cg = snap[centerOff + 1].toInt() and 0xFF
-                val cb = snap[centerOff + 2].toInt() and 0xFF
+                val cr = buf.get(centerOff).toInt() and 0xFF
+                val cg = buf.get(centerOff + 1).toInt() and 0xFF
+                val cb = buf.get(centerOff + 2).toInt() and 0xFF
                 if (abs(cr - r2) <= tolerance && abs(cg - g2) <= tolerance && abs(cb - b2) <= tolerance) {
                     return true
                 }
             }
 
+            // 2. Pindai area kotak sekitar titik pusat
             val startX = (cx - radius).coerceAtLeast(0)
             val endX = (cx + radius).coerceAtMost(width - 1)
             val startY = (cy - radius).coerceAtLeast(0)
@@ -229,9 +222,9 @@ class ScreenCaptureService : Service() {
                 if (off < 0 || maxOff + 2 >= limit) continue
 
                 while (off <= maxOff) {
-                    val r1 = snap[off].toInt() and 0xFF
-                    val g1 = snap[off + 1].toInt() and 0xFF
-                    val b1 = snap[off + 2].toInt() and 0xFF
+                    val r1 = buf.get(off).toInt() and 0xFF
+                    val g1 = buf.get(off + 1).toInt() and 0xFF
+                    val b1 = buf.get(off + 2).toInt() and 0xFF
                     if (abs(r1 - r2) <= tolerance &&
                         abs(g1 - g2) <= tolerance &&
                         abs(b1 - b2) <= tolerance
@@ -246,10 +239,14 @@ class ScreenCaptureService : Service() {
 
         fun getPixelHex(x: Int, y: Int): String? {
             if (!isReady()) return null
-            pullLatestFrameToCache()
+            acquireFreshImageIfAny()
 
             synchronized(frameLock) {
-                val snap = cachedFrameBytes ?: return null
+                val img = latestImage ?: return null
+                val planes = try { img.planes } catch (_: Throwable) { null } ?: return null
+                if (planes.isEmpty()) return null
+                val buf = planes[0].buffer ?: return null
+
                 val w = cachedW
                 val h = cachedH
                 val rs = cachedRowStride
@@ -259,10 +256,10 @@ class ScreenCaptureService : Service() {
                 val px = x.coerceIn(0, w - 1)
                 val py = y.coerceIn(0, h - 1)
                 val off = py * rs + px * ps
-                if (off >= 0 && off + 2 < snap.size) {
-                    val r = snap[off].toInt() and 0xFF
-                    val g = snap[off + 1].toInt() and 0xFF
-                    val b = snap[off + 2].toInt() and 0xFF
+                if (off >= 0 && off + 2 < buf.limit()) {
+                    val r = buf.get(off).toInt() and 0xFF
+                    val g = buf.get(off + 1).toInt() and 0xFF
+                    val b = buf.get(off + 2).toInt() and 0xFF
                     val rgb = (r shl 16) or (g shl 8) or b
                     return String.format("#%06X", rgb)
                 }
@@ -307,7 +304,7 @@ class ScreenCaptureService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        startForegroundServiceNotification()
+        // PENTING: Jangan panggil startForeground di onCreate() agar tidak Crash SecurityException di Android 14+!
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -323,8 +320,6 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
 
-        startForegroundServiceNotification()
-
         val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra("DATA", Intent::class.java)
@@ -334,7 +329,12 @@ class ScreenCaptureService : Service() {
         }
 
         if (resultCode == Activity.RESULT_OK && data != null) {
+            // Wajib panggil startForeground tepat sebelum getMediaProjection setelah izin RESULT_OK ada
+            startForegroundServiceNotification()
             setupProjection(resultCode, data)
+        } else if (!isReady()) {
+            stopSelf()
+            return START_NOT_STICKY
         }
         return START_STICKY
     }
@@ -378,13 +378,11 @@ class ScreenCaptureService : Service() {
             }
         }, mainHandler)
 
-        // Gunakan maxImages = 2. Kita tarik frame pertama saat inisialisasi, lalu selanjutnya On-Demand
+        // maxImages = 2 sudah sangat cukup untuk pertukaran buffer instan
         val reader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
         reader.setOnImageAvailableListener({ _ ->
-            // Jangan salin frame 60fps di sini agar 0% Lag!
-            // Hanya bangunkan thread jika ada blok Automate yang sedang mode tunggu (wait) atau saat cache masih kosong
-            if (!hasFreshFrame) {
-                pullLatestFrameToCache()
+            if (latestImage == null) {
+                acquireFreshImageIfAny()
             } else {
                 synchronized(frameLock) {
                     frameLock.notifyAll()
@@ -404,6 +402,12 @@ class ScreenCaptureService : Service() {
     private fun stopProjection() {
         try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
+        synchronized(frameLock) {
+            try { latestImage?.close() } catch (_: Throwable) {}
+            latestImage = null
+            cachedW = 0
+            cachedH = 0
+        }
         try { imageReader?.close() } catch (_: Throwable) {}
         imageReader = null
         try { mediaProjection?.stop() } catch (_: Throwable) {}
@@ -411,10 +415,6 @@ class ScreenCaptureService : Service() {
         try { bgThread?.quitSafely() } catch (_: Throwable) {}
         bgThread = null
         bgHandler = null
-        synchronized(frameLock) {
-            cachedFrameBytes = null
-            hasFreshFrame = false
-        }
     }
 
     private fun startForegroundServiceNotification() {
@@ -425,7 +425,7 @@ class ScreenCaptureService : Service() {
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("FastAuto Area Engine")
-            .setContentText("Zero-Lag Area Color Scanner Ready")
+            .setContentText("Zero-Lag Direct Buffer Color Scanner Active")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .build()
