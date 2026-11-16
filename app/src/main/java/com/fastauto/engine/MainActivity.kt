@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area Sekitar (On-Demand Zero-Lag & Akurat 100% di Semua HP) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi kamera layar."
+            text = "Mesin Pemindai Area Sekitar (Direct Buffer Zero-Lag & Akurat 100% di Semua HP) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi kamera layar."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -125,10 +125,8 @@ class MainActivity : AppCompatActivity() {
 
         mainLayout.addView(createButton("3. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
             removeAllOverlays()
-            val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
-                action = "STOP_SERVICE"
-            }
-            startService(stopIntent)
+            // Gunakan stopService langsung agar aman di Android 14/15/16
+            stopService(Intent(this, ScreenCaptureService::class.java))
             statusText.postDelayed({ updateStatus() }, 300)
             Toast.makeText(this, "Mesin pembaca warna berhasil dimatikan", Toast.LENGTH_SHORT).show()
         })
