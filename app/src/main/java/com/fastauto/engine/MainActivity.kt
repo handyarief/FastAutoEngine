@@ -57,27 +57,25 @@ class MainActivity : AppCompatActivity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
-    private fun getRealScreenSize(): Pair<Int, Int> {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-        val w = metrics.widthPixels.coerceAtLeast(1)
-        val h = metrics.heightPixels.coerceAtLeast(1)
-        return Pair(w, h)
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Set titik awal di tengah layar asli HP (Baik 720p seperti Samsung A07 maupun 1080p seperti Infinix)
-        val (realW, realH) = getRealScreenSize()
-        val prefs = getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE)
-        lastPickedX = prefs.getInt("picked_x", realW / 2).coerceIn(0, realW - 1)
-        lastPickedY = prefs.getInt("picked_y", realH / 2).coerceIn(0, realH - 1)
-        lastPickedHex = prefs.getString("picked_hex", "#FF0000") ?: "#FF0000"
-
+        val (w, h) = getExactScreenSize()
+        lastPickedX = w / 2
+        lastPickedY = h / 2
         setupUI()
+    }
+
+    private fun getExactScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = wm.maximumWindowMetrics.bounds
+            Pair(b.width().coerceAtLeast(1), b.height().coerceAtLeast(1))
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            Pair(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1))
+        }
     }
 
     private fun setupUI() {
@@ -96,7 +94,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area Sekitar (< 0.01ms, Akurat 100% di Semua Resolusi Layar, Zero-Lag & Dingin) untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad untuk menentukan titik pusat area pencarian warna."
+            text = "Mesin Pemindai Area Sekitar (< 0.01ms, Zero-Lag & Akurat di Semua Resolusi HD+/FHD+) untuk Automate.\n\nGeser Lubang Bidik Kuning atau gunakan Joystick D-Pad untuk menentukan titik pusat area pencarian warna."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 24)
@@ -146,8 +144,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
-        val (w, h) = getRealScreenSize()
-        statusText.text = "Mesin Area RAM (${w}x${h}): ${if (colorOk) "✅ AKTIF (<0.01ms Siap Dipakai Automate)" else "❌ MATI"}"
+        statusText.text = "Mesin Area RAM: ${if (colorOk) "✅ AKTIF (<0.01ms Siap Dipakai Automate)" else "❌ MATI"}"
     }
 
     private fun removeAllOverlays() {
@@ -184,15 +181,14 @@ class MainActivity : AppCompatActivity() {
                 val cy = locAfter[1] + (target.height / 2)
                 refreshColorAt(cx, cy)
             }
-            uiHandler.postDelayed(delayedSampleRunnable!!, 35L)
+            uiHandler.postDelayed(delayedSampleRunnable!!, 45L)
         }
     }
 
     private fun refreshColorAt(rawX: Int, rawY: Int) {
-        val (physW, physH) = getRealScreenSize()
+        val (physW, physH) = getExactScreenSize()
 
-        // Gunakan ukuran riil buffer ImageReader TANPA paksaan coerceAtLeast(1080)
-        // Ini kunci utama agar HP HD+ (720x1600) seperti Samsung A07 akurat 100% 1:1!
+        // Gunakan ukuran asli buffer ImageReader tanpa coerceAtLeast(1080) agar Samsung A07 (720x1600) 100% akurat!
         val bufW = if (ScreenCaptureService.screenWidth > 0) ScreenCaptureService.screenWidth else physW
         val bufH = if (ScreenCaptureService.screenHeight > 0) ScreenCaptureService.screenHeight else physH
 
@@ -219,15 +215,15 @@ class MainActivity : AppCompatActivity() {
         val target = crosshairView ?: return
         val cParams = cParamsRef ?: return
 
-        val (physW, physH) = getRealScreenSize()
+        val (maxW, maxH) = getExactScreenSize()
 
         val loc = IntArray(2)
         target.getLocationOnScreen(loc)
         val currentScreenX = loc[0] + (target.width / 2)
         val currentScreenY = loc[1] + (target.height / 2)
 
-        val nextScreenX = (currentScreenX + dx).coerceIn(0, physW - 1)
-        val nextScreenY = (currentScreenY + dy).coerceIn(0, physH - 1)
+        val nextScreenX = (currentScreenX + dx).coerceIn(0, maxW - 1)
+        val nextScreenY = (currentScreenY + dy).coerceIn(0, maxH - 1)
 
         cParams.x = nextScreenX - (crosshairSizePx / 2) - statusOffsetX
         cParams.y = nextScreenY - (crosshairSizePx / 2) - statusOffsetY
@@ -247,10 +243,6 @@ class MainActivity : AppCompatActivity() {
     private fun showFloatingPicker() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (floatingView != null) return
-
-        val (physW, physH) = getRealScreenSize()
-        lastPickedX = lastPickedX.coerceIn(0, physW - 1)
-        lastPickedY = lastPickedY.coerceIn(0, physH - 1)
 
         ScreenCaptureService.isPickerOverlayOpen = true
         ScreenCaptureService.updatePickerTarget(lastPickedX, lastPickedY)
@@ -617,11 +609,10 @@ class MainActivity : AppCompatActivity() {
                 canvas.drawCircle(cx, cy, 30f, paintOuter)
                 canvas.drawCircle(cx, cy, 30f, paintRing)
 
-                // Lubang tengah radius 14px benar-benar kosong/transparan agar tidak pernah menghalangi pembacaan piksel
-                canvas.drawLine(0f, cy, cx - 14f, cy, paintLine)
-                canvas.drawLine(cx + 14f, cy, width.toFloat(), cy, paintLine)
-                canvas.drawLine(cx, 0f, cx, cy - 14f, paintLine)
-                canvas.drawLine(cx, cy + 14f, cx, height.toFloat(), paintLine)
+                canvas.drawLine(0f, cy, cx - 12f, cy, paintLine)
+                canvas.drawLine(cx + 12f, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - 12f, paintLine)
+                canvas.drawLine(cx, cy + 12f, cx, height.toFloat(), paintLine)
             }
         }
 
@@ -678,7 +669,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
+        super.onActivityResult(requestCode, resultCode: Int, data)
         if (requestCode == 1001 && resultCode == Activity.RESULT_OK && data != null) {
             val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
