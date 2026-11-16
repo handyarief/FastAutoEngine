@@ -47,7 +47,7 @@ class PluginConfigActivity : Activity() {
         layout.addView(title)
 
         val subInfo = TextView(this).apply {
-            text = "Arsitektur Pre-Cached Bulk RAM (< 0.01ms, Akurat 100%, Anti-Lag & Dingin)."
+            text = "Arsitektur Direct ByteBuffer Zero-Copy (< 0.01ms, Akurat 100%, Anti-Lag & Dingin)."
             textSize = 13f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 20)
@@ -175,7 +175,6 @@ class PluginConfigActivity : Activity() {
                 val tol = (tolInput.text.toString().toIntOrNull() ?: 20).coerceIn(0, 255)
                 val timeout = (timeoutInput.text.toString().toLongOrNull() ?: 0L).coerceIn(0L, 8000L)
 
-                // Pre-register langsung ke RAM Service agar pembacaan pertama langsung < 0.01 ms
                 ScreenCaptureService.registerWatchConfig(
                     x1, y1, rgb1,
                     useColor2, colorLogic,
@@ -184,11 +183,11 @@ class PluginConfigActivity : Activity() {
                 )
 
                 val resultBundle = Bundle().apply {
-                    putInt("mode", 2) // Kunci ke Mode Area
+                    putInt("mode", 2)
                     putInt("x", x1)
                     putInt("y", y1)
                     putString("hex", hex1)
-                    putInt("rgb1", rgb1) // Pre-parsed Int (Tanpa overhead parsing saat runtime)
+                    putInt("rgb1", rgb1)
                     putBoolean("useColor2", useColor2)
                     putInt("colorLogic", colorLogic)
                     putInt("x2", x2)
