@@ -111,7 +111,6 @@ class FastAccessibilityService : AccessibilityService() {
                                 val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, srgb)
                                 if (hwBitmap != null) {
                                     if (x in 0 until hwBitmap.width && y in 0 until hwBitmap.height) {
-                                        // Hanya potong 1x1 piksel agar hemat 99.9% RAM dibanding salin layar penuh
                                         val pixelBmp = Bitmap.createBitmap(hwBitmap, x, y, 1, 1)
                                         val softBmp = pixelBmp.copy(Bitmap.Config.ARGB_8888, false)
                                         if (softBmp != null) {
@@ -164,7 +163,6 @@ class FastAccessibilityService : AccessibilityService() {
                         override fun onSuccess(screenshotResult: ScreenshotResult) {
                             val hwBuffer = screenshotResult.hardwareBuffer
                             try {
-                                // Kunci ke sRGB agar 100% akurat & identik dengan MediaProjection
                                 val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
                                 val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, srgb)
                                 if (hwBitmap != null) {
@@ -176,7 +174,6 @@ class FastAccessibilityService : AccessibilityService() {
                                     val cropH = bottom - top + 1
 
                                     if (cropW > 0 && cropH > 0) {
-                                        // Hanya salin kotak area target (bukan layar penuh) agar dingin & hemat RAM
                                         val subHw = Bitmap.createBitmap(hwBitmap, left, top, cropW, cropH)
                                         val softBmp = subHw.copy(Bitmap.Config.ARGB_8888, false)
                                         if (softBmp != null) {
@@ -225,7 +222,6 @@ class FastAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        // HANYA periksa saat jendela baru muncul (STATE_CHANGED), abaikan CONTENT_CHANGED agar 0% lag CPU!
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
 
         val pkg = event.packageName?.toString()?.lowercase() ?: ""
