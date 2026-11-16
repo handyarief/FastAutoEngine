@@ -28,7 +28,6 @@
             android:label="⚡ FastAuto Cari Warna Area">
             <intent-filter>
                 <action android:name="com.twofortyfouram.locale.intent.action.EDIT_CONDITION" />
-                <action android:name="com.twofortyfouram.locale.intent.action.EDIT_SETTING" />
             </intent-filter>
         </activity>
 
@@ -37,7 +36,6 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.twofortyfouram.locale.intent.action.QUERY_CONDITION" />
-                <action android:name="com.twofortyfouram.locale.intent.action.FIRE_SETTING" />
             </intent-filter>
         </receiver>
 
