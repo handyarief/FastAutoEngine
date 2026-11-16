@@ -188,7 +188,6 @@ class MainActivity : AppCompatActivity() {
     private fun refreshColorAt(rawX: Int, rawY: Int) {
         val (physW, physH) = getExactScreenSize()
 
-        // Gunakan ukuran asli buffer ImageReader tanpa coerceAtLeast(1080) agar Samsung A07 (720x1600) 100% akurat!
         val bufW = if (ScreenCaptureService.screenWidth > 0) ScreenCaptureService.screenWidth else physW
         val bufH = if (ScreenCaptureService.screenHeight > 0) ScreenCaptureService.screenHeight else physH
 
@@ -669,7 +668,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode: Int, data)
+        super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 1001 && resultCode == Activity.RESULT_OK && data != null) {
             val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
