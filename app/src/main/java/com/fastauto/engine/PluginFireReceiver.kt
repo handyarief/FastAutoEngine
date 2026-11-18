@@ -11,7 +11,7 @@ class PluginFireReceiver : BroadcastReceiver() {
         const val RESULT_CONDITION_SATISFIED = 16
         const val RESULT_CONDITION_UNSATISFIED = 17
 
-        // Satu Reusable Thread Statis (Tanpa alokasi Thread baru agar hemat CPU & RAM)
+        // Satu Reusable Thread Statis khusus untuk mode timeout > 0 (Tanpa alokasi Thread baru)
         private val workerExecutor = Executors.newSingleThreadExecutor()
     }
 
@@ -48,14 +48,8 @@ class PluginFireReceiver : BroadcastReceiver() {
         val timeout = bundle.getLong("timeout", 0L)
 
         val ramReady = ScreenCaptureService.isReady()
-        val stealthReady = FastAccessibilityService.instance != null
 
-        if (!ramReady && !stealthReady) {
-            if (isOrderedBroadcast) resultCode = RESULT_CONDITION_UNSATISFIED
-            return
-        }
-
-        // JALUR SUPER CEPAT (< 0.01 ms Murni Zero-Copy Tanpa Alokasi Thread) saat Mesin RAM Siap & Timeout == 0
+        // JALUR SUPER CEPAT (< 0.01 ms Murni On-Demand Tanpa Thread) saat Mesin RAM Siap & Timeout == 0
         if (ramReady && timeout <= 0L) {
             val matched = ScreenCaptureService.evaluateAreaInstantOrWait(
                 x1, y1, targetRgb1,
@@ -67,6 +61,12 @@ class PluginFireReceiver : BroadcastReceiver() {
             if (isOrderedBroadcast) {
                 resultCode = if (matched) RESULT_CONDITION_SATISFIED else RESULT_CONDITION_UNSATISFIED
             }
+            return
+        }
+
+        val stealthReady = FastAccessibilityService.instance != null
+        if (!ramReady && !stealthReady) {
+            if (isOrderedBroadcast) resultCode = RESULT_CONDITION_UNSATISFIED
             return
         }
 
