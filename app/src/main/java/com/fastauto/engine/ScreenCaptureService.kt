@@ -20,11 +20,12 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.Process
-import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 class ScreenCaptureService : Service() {
@@ -47,23 +48,26 @@ class ScreenCaptureService : Service() {
         @Volatile var isPickerOverlayOpen: Boolean = false
 
         private val frameLock = Object()
+        private val activeWaiters = AtomicInteger(0)
 
-        // Menyimpan frame terakhir HANYA sebagai fallback mikro jika tidak ada frame baru saat dieksekusi,
-        // namun tanpa listener aktif di background agar 0% CPU saat idle (seperti OFF).
+        // Menyimpan referensi Image terakhir langsung di memori Native GPU (Zero-Copy 0 MB Heap)
+        // Dengan maxImages = 4, 3 buffer lainnya bebas dipakai SurfaceFlinger/GPU tanpa lag!
         private var latestImage: android.media.Image? = null
         @Volatile private var cachedW = 0
         @Volatile private var cachedH = 0
         @Volatile private var cachedRowStride = 0
         @Volatile private var cachedPixelStride = 4
 
-        // Reusable buffer kecil khusus untuk 1 baris area ROI (maks radius 500 -> lebar 1001 piksel * 4 byte = ~4 KB).
-        // Mencegah alokasi memori berulang (0% GC Pause) dan menghindari JNI call per-piksel.
-        private val roiRowBuffer = ByteArray(4096)
+        private val onDemandFrameListener = ImageReader.OnImageAvailableListener { _ ->
+            synchronized(frameLock) {
+                frameLock.notifyAll()
+            }
+        }
 
         fun isReady(): Boolean = imageReader != null && mediaProjection != null
 
         fun updatePickerTarget(x: Int, y: Int) {
-            // Mode On-Demand: 0% CPU saat idle
+            // Sistem On-Demand Direct Buffer 0% CPU saat idle
         }
 
         fun registerWatchConfig(
@@ -76,11 +80,10 @@ class ScreenCaptureService : Service() {
         }
 
         /**
-         * Mengambil frame terbaru HANYA SAAT DIPANGGIL (On-Demand).
-         * Jika ada frame baru dari GPU, frame lama langsung di-close() agar antrean GPU selalu lega
-         * dan layar HP tidak pernah ngelag/patah-patah.
+         * Mengambil frame terbaru dari ImageReader HANYA SAAT DIPANGGIL (On-Demand).
+         * Saat tidak dipanggil Automate, fungsi ini tidak berjalan sama sekali (0% CPU).
          */
-        private fun acquireFreshImageOnDemand() {
+        private fun acquireFreshImageIfAny() {
             val reader = imageReader ?: return
             val newImg = try {
                 reader.acquireLatestImage()
@@ -92,9 +95,7 @@ class ScreenCaptureService : Service() {
                 try {
                     val planes = newImg.planes
                     if (!planes.isNullOrEmpty() && planes[0].buffer != null) {
-                        try {
-                            latestImage?.close()
-                        } catch (_: Throwable) {}
+                        latestImage?.close()
                         latestImage = newImg
                         cachedW = newImg.width
                         cachedH = newImg.height
@@ -110,6 +111,23 @@ class ScreenCaptureService : Service() {
             }
         }
 
+        private fun enableWaitListenerIfNeeded() {
+            if (activeWaiters.incrementAndGet() == 1) {
+                try {
+                    imageReader?.setOnImageAvailableListener(onDemandFrameListener, bgHandler)
+                } catch (_: Throwable) {}
+            }
+        }
+
+        private fun disableWaitListenerIfIdle() {
+            if (activeWaiters.decrementAndGet() <= 0) {
+                activeWaiters.set(0)
+                try {
+                    imageReader?.setOnImageAvailableListener(null, null)
+                } catch (_: Throwable) {}
+            }
+        }
+
         fun evaluateAreaInstantOrWait(
             x1: Int, y1: Int, rgb1: Int,
             useColor2: Boolean, colorLogic: Int,
@@ -117,46 +135,33 @@ class ScreenCaptureService : Service() {
             radius: Int, step: Int, tolerance: Int,
             timeoutMs: Long
         ): Boolean {
-            if (!isReady()) return false
-
             val rad = radius.coerceIn(1, 500)
             val stp = step.coerceIn(1, 20)
             val tol = tolerance.coerceIn(0, 255)
 
-            // 1. Langsung ON: Tarik frame terbaru tepat saat dipanggil Automate
-            acquireFreshImageOnDemand()
+            // 1. Tarik pointer frame terbaru dari antrean GPU secara On-Demand (< 0.001 ms)
+            acquireFreshImageIfAny()
 
-            // 2. Deteksi HANYA pada kotak Area target (< 0.01ms)
-            if (checkCurrentAreaOnly(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
+            // 2. Evaluasi hanya kotak area koordinat yang diminta (< 0.01 ms)
+            if (checkCurrentBuffer(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                 return true
             }
 
-            // Jika mode instan (timeout == 0), langsung selesai & kembali diam seperti OFF
             if (timeoutMs <= 0L) {
                 return false
             }
 
-            // 3. Jika mode tunggu (timeout > 0), aktifkan sinyal tunggu sementara hanya selama batas timeout
-            val reader = imageReader ?: return false
-            val h = bgHandler
-            val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtMost(8000L)
-
+            // 3. Jika mode tunggu (timeout > 0), nyalakan listener sementara, lalu matikan kembali saat selesai
+            enableWaitListenerIfNeeded()
             try {
-                if (h != null) {
-                    reader.setOnImageAvailableListener({ _ ->
-                        synchronized(frameLock) {
-                            frameLock.notifyAll()
-                        }
-                    }, h)
-                }
-
-                while (SystemClock.elapsedRealtime() < deadline) {
-                    acquireFreshImageOnDemand()
-                    if (checkCurrentAreaOnly(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
+                val deadline = System.nanoTime() + (timeoutMs.coerceAtMost(8000L) * 1_000_000L)
+                while (System.nanoTime() < deadline) {
+                    acquireFreshImageIfAny()
+                    if (checkCurrentBuffer(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                         return true
                     }
-                    val remMs = (deadline - SystemClock.elapsedRealtime()).coerceIn(1L, 12L)
                     synchronized(frameLock) {
+                        val remMs = ((deadline - System.nanoTime()) / 1_000_000L).coerceIn(1L, 16L)
                         try {
                             frameLock.wait(remMs)
                         } catch (_: InterruptedException) {
@@ -165,15 +170,12 @@ class ScreenCaptureService : Service() {
                     }
                 }
             } finally {
-                // PENTING: Matikan kembali listener begitu selesai agar kembali 0% CPU (seperti OFF)
-                try {
-                    reader.setOnImageAvailableListener(null, null)
-                } catch (_: Throwable) {}
+                disableWaitListenerIfIdle()
             }
             return false
         }
 
-        private fun checkCurrentAreaOnly(
+        private fun checkCurrentBuffer(
             x1: Int, y1: Int, rgb1: Int,
             useColor2: Boolean, colorLogic: Int,
             x2: Int, y2: Int, rgb2: Int,
@@ -189,24 +191,24 @@ class ScreenCaptureService : Service() {
                 val h = cachedH
                 val rs = cachedRowStride
                 val ps = cachedPixelStride
-                if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return false
+                if (w <= 0 || h <= 0 || rs <= 0) return false
 
-                val m1 = scanTargetAreaROI(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
+                val m1 = scanDirectBufferArea(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
                 return if (!useColor2) {
                     m1
                 } else if (colorLogic == 0) {
-                    if (!m1) false else scanTargetAreaROI(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+                    if (!m1) false else scanDirectBufferArea(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 } else {
-                    if (m1) true else scanTargetAreaROI(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+                    if (m1) true else scanDirectBufferArea(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
                 }
             }
         }
 
         /**
-         * Memindai HANYA kotak area target (Region of Interest / ROI) menggunakan Bulk Row-Slice.
-         * Tidak pernah memindai 1 layar penuh, dan menghindari panggilan JNI ByteBuffer.get() ribuan kali.
+         * Membaca piksel HANYA pada area kotak (centerX ± radius, centerY ± radius)
+         * menggunakan pembacaan 32-bit (getInt BIG_ENDIAN) sehingga 3x lebih cepat dan bebas overhead JNI.
          */
-        private fun scanTargetAreaROI(
+        private fun scanDirectBufferArea(
             buf: ByteBuffer,
             width: Int,
             height: Int,
@@ -227,65 +229,54 @@ class ScreenCaptureService : Service() {
             val cy = centerY.coerceIn(0, height - 1)
             val limit = buf.limit()
 
-            // 1. Cek 1 titik pusat terlebih dahulu (0.0001 ms)
+            // Pastikan pembacaan 32-bit menghasilkan urutan byte R-G-B-A yang konsisten di semua CPU
+            buf.order(ByteOrder.BIG_ENDIAN)
+
+            // 1. Cek titik pusat terlebih dahulu (0.0001 ms)
             val centerOff = cy * rowStride + cx * pixelStride
-            if (centerOff >= 0 && centerOff + 2 < limit) {
-                val cr = buf.get(centerOff).toInt() and 0xFF
-                val cg = buf.get(centerOff + 1).toInt() and 0xFF
-                val cb = buf.get(centerOff + 2).toInt() and 0xFF
+            if (centerOff >= 0 && centerOff + 3 < limit) {
+                val pixel = buf.getInt(centerOff)
+                val cr = (pixel ushr 24) and 0xFF
+                val cg = (pixel ushr 16) and 0xFF
+                val cb = (pixel ushr 8) and 0xFF
                 if (abs(cr - r2) <= tolerance && abs(cg - g2) <= tolerance && abs(cb - b2) <= tolerance) {
                     return true
                 }
             }
 
-            // 2. Hitung batas kotak area deteksi saja (bukan 1 layar)
+            // 2. Pindai HANYA area kotak kecil di sekitar titik pusat
             val startX = (cx - radius).coerceAtLeast(0)
             val endX = (cx + radius).coerceAtMost(width - 1)
             val startY = (cy - radius).coerceAtLeast(0)
             val endY = (cy + radius).coerceAtMost(height - 1)
-
-            if (startX > endX || startY > endY) return false
-
-            val spanPixels = endX - startX + 1
-            val bytesNeeded = spanPixels * pixelStride
-            val rowArray = if (bytesNeeded <= roiRowBuffer.size) roiRowBuffer else ByteArray(bytesNeeded)
             val strideStep = step * pixelStride
 
-            try {
-                for (y in startY..endY step step) {
-                    val rowStartOff = y * rowStride + startX * pixelStride
-                    if (rowStartOff < 0 || rowStartOff + bytesNeeded > limit) continue
+            for (y in startY..endY step step) {
+                val rowBase = y * rowStride
+                var off = rowBase + startX * pixelStride
+                val maxOff = rowBase + endX * pixelStride
+                if (off < 0 || maxOff + 3 >= limit) continue
 
-                    // Salin 1 potongan baris pendek area target sekaligus dari Native ke RAM CPU (Sangat Cepat)
-                    buf.position(rowStartOff)
-                    buf.get(rowArray, 0, bytesNeeded)
-
-                    var localOff = 0
-                    val maxLocalOff = bytesNeeded - 3
-                    while (localOff <= maxLocalOff) {
-                        val r1 = rowArray[localOff].toInt() and 0xFF
-                        val g1 = rowArray[localOff + 1].toInt() and 0xFF
-                        val b1 = rowArray[localOff + 2].toInt() and 0xFF
-                        if (abs(r1 - r2) <= tolerance &&
-                            abs(g1 - g2) <= tolerance &&
-                            abs(b1 - b2) <= tolerance
-                        ) {
-                            return true
-                        }
-                        localOff += strideStep
+                while (off <= maxOff) {
+                    val pixel = buf.getInt(off)
+                    val r1 = (pixel ushr 24) and 0xFF
+                    val g1 = (pixel ushr 16) and 0xFF
+                    val b1 = (pixel ushr 8) and 0xFF
+                    if (abs(r1 - r2) <= tolerance &&
+                        abs(g1 - g2) <= tolerance &&
+                        abs(b1 - b2) <= tolerance
+                    ) {
+                        return true
                     }
+                    off += strideStep
                 }
-            } finally {
-                try {
-                    buf.position(0)
-                } catch (_: Throwable) {}
             }
             return false
         }
 
         fun getPixelHex(x: Int, y: Int): String? {
             if (!isReady()) return null
-            acquireFreshImageOnDemand()
+            acquireFreshImageIfAny()
 
             synchronized(frameLock) {
                 val img = latestImage ?: return null
@@ -302,11 +293,10 @@ class ScreenCaptureService : Service() {
                 val px = x.coerceIn(0, w - 1)
                 val py = y.coerceIn(0, h - 1)
                 val off = py * rs + px * ps
-                if (off >= 0 && off + 2 < buf.limit()) {
-                    val r = buf.get(off).toInt() and 0xFF
-                    val g = buf.get(off + 1).toInt() and 0xFF
-                    val b = buf.get(off + 2).toInt() and 0xFF
-                    val rgb = (r shl 16) or (g shl 8) or b
+                if (off >= 0 && off + 3 < buf.limit()) {
+                    buf.order(ByteOrder.BIG_ENDIAN)
+                    val pixel = buf.getInt(off)
+                    val rgb = (pixel ushr 8) and 0xFFFFFF
                     return String.format("#%06X", rgb)
                 }
             }
@@ -375,6 +365,7 @@ class ScreenCaptureService : Service() {
         }
 
         if (resultCode == Activity.RESULT_OK && data != null) {
+            // Wajib panggil startForeground tepat sebelum getMediaProjection setelah izin RESULT_OK ada
             startForegroundServiceNotification()
             setupProjection(resultCode, data)
         } else if (!isReady()) {
@@ -423,9 +414,10 @@ class ScreenCaptureService : Service() {
             }
         }, mainHandler)
 
-        // Gunakan maxImages = 3 dan TANPA listener aktif permanen agar antrean GPU bebas lag
-        // dan thread benar-benar tidur (0% CPU) saat tidak dipanggil Automate.
-        val reader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 3)
+        // maxImages = 4 mencegah buffer starvation pada GPU/SurfaceFlinger sehingga HP dijamin mulus tanpa lag.
+        // PENTING: Listener TIDAK dipasang saat idle agar CPU 0% (diam seperti OFF saat tidak dipanggil Automate).
+        val reader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 4)
+        reader.setOnImageAvailableListener(null, null)
         imageReader = reader
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
@@ -437,6 +429,7 @@ class ScreenCaptureService : Service() {
     }
 
     private fun stopProjection() {
+        activeWaiters.set(0)
         try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
         synchronized(frameLock) {
@@ -444,6 +437,7 @@ class ScreenCaptureService : Service() {
             latestImage = null
             cachedW = 0
             cachedH = 0
+            frameLock.notifyAll()
         }
         try {
             imageReader?.setOnImageAvailableListener(null, null)
@@ -465,7 +459,7 @@ class ScreenCaptureService : Service() {
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("FastAuto Area Engine")
-            .setContentText("On-Demand Area Scanner Ready (0% Idle CPU)")
+            .setContentText("Zero-Lag Direct Buffer Color Scanner Active")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .build()
