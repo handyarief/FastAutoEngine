@@ -27,6 +27,10 @@ class FastAccessibilityService : AccessibilityService() {
         private var lastDismissTime = 0L
         private val mainHandler = Handler(Looper.getMainLooper())
 
+        // Reusable buffer untuk mode cadangan (Stealth) agar tidak memicu alokasi memori berulang / GC Pause
+        private var reusablePixels = IntArray(0)
+        private val pixelLock = Object()
+
         fun tap(x: Int, y: Int): Boolean {
             val service = instance ?: return false
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
@@ -180,16 +184,22 @@ class FastAccessibilityService : AccessibilityService() {
                                         val subHw = Bitmap.createBitmap(hwBitmap, left, top, cropW, cropH)
                                         val softBmp = subHw.copy(Bitmap.Config.ARGB_8888, false)
                                         if (softBmp != null) {
-                                            val pixels = IntArray(cropW * cropH)
-                                            softBmp.getPixels(pixels, 0, cropW, 0, 0, cropW, cropH)
+                                            synchronized(pixelLock) {
+                                                val needed = cropW * cropH
+                                                if (reusablePixels.size < needed) {
+                                                    reusablePixels = IntArray(needed)
+                                                }
+                                                val pixels = reusablePixels
+                                                softBmp.getPixels(pixels, 0, cropW, 0, 0, cropW, cropH)
 
-                                            outer@ for (dy in 0 until cropH step step) {
-                                                val rowOffset = dy * cropW
-                                                for (dx in 0 until cropW step step) {
-                                                    val rgb = pixels[rowOffset + dx] and 0xFFFFFF
-                                                    if (ScreenCaptureService.compareRgbInt(rgb, targetRgb, tolerance)) {
-                                                        matched = true
-                                                        break@outer
+                                                outer@ for (dy in 0 until cropH step step) {
+                                                    val rowOffset = dy * cropW
+                                                    for (dx in 0 until cropW step step) {
+                                                        val rgb = pixels[rowOffset + dx] and 0xFFFFFF
+                                                        if (ScreenCaptureService.compareRgbInt(rgb, targetRgb, tolerance)) {
+                                                            matched = true
+                                                            break@outer
+                                                        }
                                                     }
                                                 }
                                             }
@@ -225,40 +235,41 @@ class FastAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        val type = event.eventType
-        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            type != AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+
+        // Fast-Filter Package: Hanya periksa jika jendela berasal dari komponen sistem/keamanan
+        // agar tidak mengganggu performa CPU saat Automate sedang klik cepat di aplikasi target.
+        val pkg = event.packageName?.toString()?.lowercase() ?: ""
+        if (pkg.isNotEmpty() &&
+            !pkg.contains("systemui") &&
+            !pkg.contains("security") &&
+            !pkg.contains("permission") &&
+            !pkg.contains("packageinstaller") &&
+            !pkg.contains("miui") &&
+            !pkg.contains("coloros") &&
+            !pkg.contains("oplus") &&
+            !pkg.contains("vivo") &&
+            !pkg.contains("samsung") &&
+            pkg != "android"
         ) {
             return
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastDismissTime < 40L) return
+        if (now - lastDismissTime < 150L) return
 
         if (tryDismissSecurityPopup()) {
             lastDismissTime = System.currentTimeMillis()
             // Sapu bersih dialog ke-2 apabila muncul beruntun (misal: Risk screen sharing -> Potential Telecom Fraud)
-            mainHandler.postDelayed({ tryDismissSecurityPopup() }, 120L)
-            mainHandler.postDelayed({ tryDismissSecurityPopup() }, 260L)
+            mainHandler.postDelayed({ tryDismissSecurityPopup() }, 160L)
         }
     }
 
     private fun tryDismissSecurityPopup(): Boolean {
         try {
-            val activeRoot = rootInActiveWindow
-            if (activeRoot != null && checkAndClickRiskDialog(activeRoot)) {
+            val activeRoot = rootInActiveWindow ?: return false
+            if (checkAndClickRiskDialog(activeRoot)) {
                 return true
-            }
-
-            val windowList = windows
-            if (!windowList.isNullOrEmpty()) {
-                for (win in windowList) {
-                    val root = win.root ?: continue
-                    if (root == activeRoot) continue
-                    if (checkAndClickRiskDialog(root)) {
-                        return true
-                    }
-                }
             }
         } catch (_: Throwable) {
         }
