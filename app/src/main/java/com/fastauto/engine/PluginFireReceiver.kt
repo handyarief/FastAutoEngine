@@ -49,7 +49,7 @@ class PluginFireReceiver : BroadcastReceiver() {
 
         val ramReady = ScreenCaptureService.isReady()
 
-        // JALUR SUPER CEPAT (< 0.01 ms Murni On-Demand Tanpa Thread) saat Mesin RAM Siap & Timeout == 0
+        // JALUR SUPER CEPAT Murni On-Demand Tanpa Thread saat Mesin RAM Siap & Timeout <= 0
         if (ramReady && timeout <= 0L) {
             val matched = ScreenCaptureService.evaluateAreaInstantOrWait(
                 x1, y1, targetRgb1,
