@@ -8,8 +8,6 @@ import android.graphics.ColorSpace
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -23,9 +21,6 @@ class FastAccessibilityService : AccessibilityService() {
         @Volatile
         var instance: FastAccessibilityService? = null
         private val screenshotExecutor = Executors.newSingleThreadExecutor()
-        @Volatile
-        private var lastDismissTime = 0L
-        private val mainHandler = Handler(Looper.getMainLooper())
 
         // Reusable buffer untuk mode cadangan (Stealth) agar tidak memicu alokasi memori berulang / GC Pause
         private var reusablePixels = IntArray(0)
@@ -236,89 +231,12 @@ class FastAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-
-        // Fast-Filter Package: Hanya periksa jika jendela berasal dari komponen sistem/keamanan
-        // agar tidak mengganggu performa CPU saat Automate sedang klik cepat di aplikasi target.
-        val pkg = event.packageName?.toString()?.lowercase() ?: ""
-        if (pkg.isNotEmpty() &&
-            !pkg.contains("systemui") &&
-            !pkg.contains("security") &&
-            !pkg.contains("permission") &&
-            !pkg.contains("packageinstaller") &&
-            !pkg.contains("miui") &&
-            !pkg.contains("coloros") &&
-            !pkg.contains("oplus") &&
-            !pkg.contains("vivo") &&
-            !pkg.contains("samsung") &&
-            pkg != "android"
-        ) {
-            return
-        }
-
-        val now = System.currentTimeMillis()
-        if (now - lastDismissTime < 150L) return
-
-        if (tryDismissSecurityPopup()) {
-            lastDismissTime = System.currentTimeMillis()
-            // Sapu bersih dialog ke-2 apabila muncul beruntun (misal: Risk screen sharing -> Potential Telecom Fraud)
-            mainHandler.postDelayed({ tryDismissSecurityPopup() }, 160L)
-        }
-    }
-
-    private fun tryDismissSecurityPopup(): Boolean {
-        try {
-            val activeRoot = rootInActiveWindow ?: return false
-            if (checkAndClickRiskDialog(activeRoot)) {
-                return true
-            }
-        } catch (_: Throwable) {
-        }
-        return false
-    }
-
-    private fun checkAndClickRiskDialog(root: AccessibilityNodeInfo): Boolean {
-        val hasRiskWarning =
-            !root.findAccessibilityNodeInfosByText("Risk screen sharing").isNullOrEmpty() ||
-            !root.findAccessibilityNodeInfosByText("Potential Telecom Fraud").isNullOrEmpty()
-
-        if (!hasRiskWarning) return false
-
-        val buttonLabels = arrayOf("Close", "Tutup", "OK")
-        for (label in buttonLabels) {
-            val closeNodes = root.findAccessibilityNodeInfosByText(label)
-            if (!closeNodes.isNullOrEmpty()) {
-                for (node in closeNodes) {
-                    if (clickNodeOrParent(node)) {
-                        return true
-                    }
-                }
-            }
-        }
-
-        val buttonIds = arrayOf(
-            "android:id/button1",
-            "android:id/button2",
-            "android:id/button3"
-        )
-        for (btnId in buttonIds) {
-            val idNodes = root.findAccessibilityNodeInfosByViewId(btnId)
-            if (!idNodes.isNullOrEmpty()) {
-                for (node in idNodes) {
-                    if (clickNodeOrParent(node)) {
-                        return true
-                    }
-                }
-            }
-        }
-
-        return false
     }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         super.onDestroy()
-        mainHandler.removeCallbacksAndMessages(null)
         if (instance == this) instance = null
     }
 }
