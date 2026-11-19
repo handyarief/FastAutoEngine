@@ -94,14 +94,18 @@ class ScreenCaptureService : Service() {
             synchronized(frameLock) {
                 try {
                     val planes = newImg.planes
-                    if (!planes.isNullOrEmpty() && planes[0].buffer != null) {
-                        latestImage?.close()
-                        latestImage = newImg
-                        cachedW = newImg.width
-                        cachedH = newImg.height
-                        cachedRowStride = planes[0].rowStride
-                        cachedPixelStride = planes[0].pixelStride
-                        return
+                    if (!planes.isNullOrEmpty()) {
+                        val buf = planes[0].buffer
+                        if (buf != null) {
+                            buf.order(ByteOrder.BIG_ENDIAN)
+                            latestImage?.close()
+                            latestImage = newImg
+                            cachedW = newImg.width
+                            cachedH = newImg.height
+                            cachedRowStride = planes[0].rowStride
+                            cachedPixelStride = planes[0].pixelStride
+                            return
+                        }
                     }
                 } catch (_: Throwable) {
                 }
@@ -139,10 +143,10 @@ class ScreenCaptureService : Service() {
             val stp = step.coerceIn(1, 20)
             val tol = tolerance.coerceIn(0, 255)
 
-            // 1. Tarik pointer frame terbaru dari antrean GPU secara On-Demand (< 0.001 ms)
+            // 1. Tarik pointer frame terbaru dari antrean GPU secara On-Demand
             acquireFreshImageIfAny()
 
-            // 2. Evaluasi hanya kotak area koordinat yang diminta (< 0.01 ms)
+            // 2. Evaluasi hanya kotak area koordinat yang diminta
             if (checkCurrentBuffer(x1, y1, rgb1, useColor2, colorLogic, x2, y2, rgb2, rad, stp, tol)) {
                 return true
             }
@@ -191,7 +195,9 @@ class ScreenCaptureService : Service() {
                 val h = cachedH
                 val rs = cachedRowStride
                 val ps = cachedPixelStride
-                if (w <= 0 || h <= 0 || rs <= 0) return false
+                if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return false
+
+                buf.order(ByteOrder.BIG_ENDIAN)
 
                 val m1 = scanDirectBufferArea(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
                 return if (!useColor2) {
@@ -206,7 +212,7 @@ class ScreenCaptureService : Service() {
 
         /**
          * Membaca piksel HANYA pada area kotak (centerX ± radius, centerY ± radius)
-         * menggunakan pembacaan 32-bit (getInt BIG_ENDIAN) sehingga 3x lebih cepat dan bebas overhead JNI.
+         * menggunakan pembacaan 32-bit (getInt BIG_ENDIAN).
          */
         private fun scanDirectBufferArea(
             buf: ByteBuffer,
@@ -221,18 +227,15 @@ class ScreenCaptureService : Service() {
             targetRgb: Int,
             tolerance: Int
         ): Boolean {
-            val r2 = (targetRgb shr 16) and 0xFF
-            val g2 = (targetRgb shr 8) and 0xFF
+            val r2 = (targetRgb ushr 16) and 0xFF
+            val g2 = (targetRgb ushr 8) and 0xFF
             val b2 = targetRgb and 0xFF
 
             val cx = centerX.coerceIn(0, width - 1)
             val cy = centerY.coerceIn(0, height - 1)
             val limit = buf.limit()
 
-            // Pastikan pembacaan 32-bit menghasilkan urutan byte R-G-B-A yang konsisten di semua CPU
-            buf.order(ByteOrder.BIG_ENDIAN)
-
-            // 1. Cek titik pusat terlebih dahulu (0.0001 ms)
+            // 1. Cek titik pusat terlebih dahulu
             val centerOff = cy * rowStride + cx * pixelStride
             if (centerOff >= 0 && centerOff + 3 < limit) {
                 val pixel = buf.getInt(centerOff)
@@ -250,11 +253,13 @@ class ScreenCaptureService : Service() {
             val startY = (cy - radius).coerceAtLeast(0)
             val endY = (cy + radius).coerceAtMost(height - 1)
             val strideStep = step * pixelStride
+            val rowStartBase = startX * pixelStride
+            val rowEndBase = endX * pixelStride
 
             for (y in startY..endY step step) {
                 val rowBase = y * rowStride
-                var off = rowBase + startX * pixelStride
-                val maxOff = rowBase + endX * pixelStride
+                var off = rowBase + rowStartBase
+                val maxOff = rowBase + rowEndBase
                 if (off < 0 || maxOff + 3 >= limit) continue
 
                 while (off <= maxOff) {
@@ -288,7 +293,7 @@ class ScreenCaptureService : Service() {
                 val h = cachedH
                 val rs = cachedRowStride
                 val ps = cachedPixelStride
-                if (w <= 0 || h <= 0 || rs <= 0) return null
+                if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return null
 
                 val px = x.coerceIn(0, w - 1)
                 val py = y.coerceIn(0, h - 1)
@@ -313,12 +318,12 @@ class ScreenCaptureService : Service() {
         }
 
         fun compareRgbInt(actualRgb: Int, targetRgb: Int, tolerance: Int): Boolean {
-            val r1 = (actualRgb shr 16) and 0xFF
-            val g1 = (actualRgb shr 8) and 0xFF
+            val r1 = (actualRgb ushr 16) and 0xFF
+            val g1 = (actualRgb ushr 8) and 0xFF
             val b1 = actualRgb and 0xFF
 
-            val r2 = (targetRgb shr 16) and 0xFF
-            val g2 = (targetRgb shr 8) and 0xFF
+            val r2 = (targetRgb ushr 16) and 0xFF
+            val g2 = (targetRgb ushr 8) and 0xFF
             val b2 = targetRgb and 0xFF
 
             return abs(r1 - r2) <= tolerance &&
