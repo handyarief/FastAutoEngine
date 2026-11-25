@@ -1,10 +1,12 @@
 package com.fastauto.engine
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -17,6 +19,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.TypedValue
@@ -29,8 +32,24 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val REQ_MEDIA_PROJECTION = 1001
+        private const val REQ_OVERLAY_PERMISSION = 1002
+        private const val REQ_POST_NOTIFICATIONS = 1003
+
+        private const val PREFS_NAME = "fast_auto_prefs"
+        private const val SAMPLE_THROTTLE_MS = 60L
+        private const val DELAYED_SAMPLE_MS = 45L
+    }
 
     private lateinit var statusText: TextView
     private var floatingView: View? = null
@@ -42,6 +61,10 @@ class MainActivity : AppCompatActivity() {
     private var lastPickedHex = "#FF0000"
 
     private val uiHandler = Handler(Looper.getMainLooper())
+    private val pickerExecutor = Executors.newSingleThreadExecutor()
+    private val isSamplingInFlight = AtomicBoolean(false)
+    private var lastSampleUptimeMs = 0L
+
     private var repeatRunnable: Runnable? = null
     private var delayedSampleRunnable: Runnable? = null
 
@@ -49,7 +72,6 @@ class MainActivity : AppCompatActivity() {
     private var hexTvRef: TextView? = null
     private var colorPreviewDrawable: GradientDrawable? = null
     private var cParamsRef: WindowManager.LayoutParams? = null
-    private val crosshairSizePx = 120
 
     private var statusOffsetX = 0
     private var statusOffsetY = 0
@@ -57,12 +79,35 @@ class MainActivity : AppCompatActivity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
+    private fun crosshairSizePx(): Int = dp(48).coerceAtLeast(36)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val (w, h) = getExactScreenSize()
-        lastPickedX = w / 2
-        lastPickedY = h / 2
+        lastPickedX = prefs.getInt("picked_x", w / 2)
+        lastPickedY = prefs.getInt("picked_y", h / 2)
+        lastPickedHex = ScreenCaptureService.parseHexToIntOrNull(prefs.getString("picked_hex", "#FF0000"))
+            ?.let { String.format("#%06X", it) } ?: "#FF0000"
+
         setupUI()
+        requestNotificationPermissionIfNeeded()
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    REQ_POST_NOTIFICATIONS
+                )
+            }
+        }
     }
 
     private fun getExactScreenSize(): Pair<Int, Int> {
@@ -78,26 +123,45 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun applyCutoutMode(params: WindowManager.LayoutParams) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+    }
+
     private fun setupUI() {
         val mainLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(48, 48, 48, 48)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+
+        ViewCompat.setOnApplyWindowInsetsListener(mainLayout) { v, insets ->
+            val sysBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(
+                dp(16) + sysBars.left,
+                dp(16) + sysBars.top,
+                dp(16) + sysBars.right,
+                dp(16) + sysBars.bottom
+            )
+            insets
         }
 
         val title = TextView(this).apply {
             text = "⚡ FastAuto Area Color Plugin"
             textSize = 24f
             setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 12)
+            setPadding(0, 0, 0, dp(4))
         }
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area Sekitar (Direct Buffer Zero-Lag & Akurat 100% di Semua HP) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi kamera layar."
+            text = "Mesin Pemindai Area Sekitar (1 atau 2 Warna, On-Demand True-Idle) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi layar."
             textSize = 14f
             setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, 24)
+            setPadding(0, 0, 0, dp(10))
         }
         mainLayout.addView(subtitle)
 
@@ -105,19 +169,24 @@ class MainActivity : AppCompatActivity() {
             text = "Status Mesin: Memeriksa..."
             textSize = 15f
             setTextColor(Color.parseColor("#00E676"))
-            setPadding(0, 0, 0, 32)
+            setPadding(0, 0, 0, dp(14))
         }
         mainLayout.addView(statusText)
 
         mainLayout.addView(createButton("1. Aktifkan Mesin Area RAM (Wajib)", "#8E24AA") {
             val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            startActivityForResult(mpManager.createScreenCaptureIntent(), 1001)
+            @Suppress("DEPRECATION")
+            startActivityForResult(mpManager.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
         })
 
         mainLayout.addView(createButton("2. Munculkan Alat Bidik Pusat Area (🎯)", "#00897B") {
-            if (!Settings.canDrawOverlays(this)) {
-                val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-                startActivityForResult(intent, 1002)
+            if (!hasOverlayPermission()) {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                @Suppress("DEPRECATION")
+                startActivityForResult(intent, REQ_OVERLAY_PERMISSION)
             } else {
                 showFloatingPicker()
             }
@@ -125,14 +194,24 @@ class MainActivity : AppCompatActivity() {
 
         mainLayout.addView(createButton("3. 🛑 Matikan Mesin & Hapus Notifikasi", "#C62828") {
             removeAllOverlays()
-            // Gunakan stopService langsung agar aman di Android 14/15/16
-            stopService(Intent(this, ScreenCaptureService::class.java))
-            statusText.postDelayed({ updateStatus() }, 300)
-            Toast.makeText(this, "Mesin pembaca warna berhasil dimatikan", Toast.LENGTH_SHORT).show()
+            val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_STOP_SERVICE
+            }
+            stopService(stopIntent)
+            statusText.postDelayed({ updateStatus() }, 250)
+            Toast.makeText(this, "Mesin pembaca warna dimatikan (True-Idle)", Toast.LENGTH_SHORT).show()
         })
 
         setContentView(mainLayout)
         updateStatus()
+    }
+
+    private fun hasOverlayPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(this)
+        } else {
+            true
+        }
     }
 
     override fun onResume() {
@@ -140,24 +219,58 @@ class MainActivity : AppCompatActivity() {
         updateStatus()
     }
 
+    override fun onDestroy() {
+        removeAllOverlays()
+        uiHandler.removeCallbacksAndMessages(null)
+        pickerExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
-        statusText.text = "Mesin Area RAM: ${if (colorOk) "✅ AKTIF (<0.01ms Siap Dipakai Automate)" else "❌ MATI"}"
+        statusText.text = if (colorOk) {
+            "Mesin Area RAM: ✅ AKTIF (Siap On-Demand, True-Idle saat tidak dipanggil)"
+        } else {
+            "Mesin Area RAM: ❌ MATI"
+        }
     }
 
     private fun removeAllOverlays() {
-        ScreenCaptureService.isPickerOverlayOpen = false
+        ScreenCaptureService.setPickerActive(false)
         stopRepeatMove()
         delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
+        delayedSampleRunnable = null
+
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        crosshairView?.let { try { wm.removeView(it) } catch (_: Exception) {}; crosshairView = null }
-        floatingView?.let { try { wm.removeView(it) } catch (_: Exception) {}; floatingView = null }
-        dpadView?.let { try { wm.removeView(it) } catch (_: Exception) {}; dpadView = null }
+        crosshairView?.let {
+            it.setOnTouchListener(null)
+            try { wm.removeView(it) } catch (_: Exception) {}
+            crosshairView = null
+        }
+        floatingView?.let {
+            try { wm.removeView(it) } catch (_: Exception) {}
+            floatingView = null
+        }
+        dpadView?.let {
+            try { wm.removeView(it) } catch (_: Exception) {}
+            dpadView = null
+        }
+        cParamsRef = null
+        infoTvRef = null
+        hexTvRef = null
+        colorPreviewDrawable = null
     }
 
-    private fun syncAndRefreshFromCrosshair() {
-        val target = crosshairView ?: return
+    private fun syncAndRefreshFromCrosshair(onDone: (() -> Unit)? = null) {
+        val target = crosshairView ?: run {
+            onDone?.invoke()
+            return
+        }
         target.post {
+            if (crosshairView !== target) {
+                onDone?.invoke()
+                return@post
+            }
             val loc = IntArray(2)
             target.getLocationOnScreen(loc)
 
@@ -169,23 +282,28 @@ class MainActivity : AppCompatActivity() {
 
             val trueCenterX = loc[0] + (target.width / 2)
             val trueCenterY = loc[1] + (target.height / 2)
-            refreshColorAt(trueCenterX, trueCenterY)
+            updateCoordinatesAndSample(trueCenterX, trueCenterY, forceSample = true, onDone = onDone)
 
             delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
             delayedSampleRunnable = Runnable {
+                val curTarget = crosshairView ?: return@Runnable
                 val locAfter = IntArray(2)
-                target.getLocationOnScreen(locAfter)
-                val cx = locAfter[0] + (target.width / 2)
-                val cy = locAfter[1] + (target.height / 2)
-                refreshColorAt(cx, cy)
+                curTarget.getLocationOnScreen(locAfter)
+                val cx = locAfter[0] + (curTarget.width / 2)
+                val cy = locAfter[1] + (curTarget.height / 2)
+                updateCoordinatesAndSample(cx, cy, forceSample = true)
             }
-            uiHandler.postDelayed(delayedSampleRunnable!!, 45L)
+            uiHandler.postDelayed(delayedSampleRunnable!!, DELAYED_SAMPLE_MS)
         }
     }
 
-    private fun refreshColorAt(rawX: Int, rawY: Int) {
+    private fun updateCoordinatesAndSample(
+        rawX: Int,
+        rawY: Int,
+        forceSample: Boolean,
+        onDone: (() -> Unit)? = null
+    ) {
         val (physW, physH) = getExactScreenSize()
-
         val bufW = if (ScreenCaptureService.screenWidth > 0) ScreenCaptureService.screenWidth else physW
         val bufH = if (ScreenCaptureService.screenHeight > 0) ScreenCaptureService.screenHeight else physH
 
@@ -194,17 +312,54 @@ class MainActivity : AppCompatActivity() {
 
         lastPickedX = calibratedX
         lastPickedY = calibratedY
-
-        val hex = ScreenCaptureService.getPixelHex(lastPickedX, lastPickedY)
-            ?: FastAccessibilityService.getStealthPixelHex(lastPickedX, lastPickedY)
-            ?: "#000000"
-        lastPickedHex = hex
-
         infoTvRef?.text = "X: $lastPickedX   Y: $lastPickedY"
-        hexTvRef?.text = hex
-        try {
-            colorPreviewDrawable?.setColor(Color.parseColor(hex))
-        } catch (_: Exception) {}
+
+        if (!ScreenCaptureService.isReady()) {
+            hexTvRef?.text = "MESIN MATI"
+            try { colorPreviewDrawable?.setColor(Color.parseColor("#333333")) } catch (_: Exception) {}
+            onDone?.invoke()
+            return
+        }
+
+        val now = SystemClock.uptimeMillis()
+        if (!forceSample && (now - lastSampleUptimeMs < SAMPLE_THROTTLE_MS)) {
+            onDone?.invoke()
+            return
+        }
+        if (!isSamplingInFlight.compareAndSet(false, true)) {
+            onDone?.invoke()
+            return
+        }
+
+        lastSampleUptimeMs = now
+        val targetX = calibratedX
+        val targetY = calibratedY
+
+        pickerExecutor.execute {
+            val hex = try {
+                ScreenCaptureService.getPixelHex(targetX, targetY)
+            } catch (_: Throwable) {
+                null
+            }
+            isSamplingInFlight.set(false)
+
+            uiHandler.post {
+                if (floatingView == null) {
+                    onDone?.invoke()
+                    return@post
+                }
+                if (hex != null) {
+                    lastPickedHex = hex
+                    hexTvRef?.text = hex
+                    try {
+                        colorPreviewDrawable?.setColor(Color.parseColor(hex))
+                    } catch (_: Exception) {}
+                } else {
+                    hexTvRef?.text = "N/A"
+                }
+                onDone?.invoke()
+            }
+        }
     }
 
     private fun moveCrosshairBy(dx: Int, dy: Int) {
@@ -213,6 +368,7 @@ class MainActivity : AppCompatActivity() {
         val cParams = cParamsRef ?: return
 
         val (maxW, maxH) = getExactScreenSize()
+        val sizePx = crosshairSizePx()
 
         val loc = IntArray(2)
         target.getLocationOnScreen(loc)
@@ -222,8 +378,8 @@ class MainActivity : AppCompatActivity() {
         val nextScreenX = (currentScreenX + dx).coerceIn(0, maxW - 1)
         val nextScreenY = (currentScreenY + dy).coerceIn(0, maxH - 1)
 
-        cParams.x = nextScreenX - (crosshairSizePx / 2) - statusOffsetX
-        cParams.y = nextScreenY - (crosshairSizePx / 2) - statusOffsetY
+        cParams.x = nextScreenX - (sizePx / 2) - statusOffsetX
+        cParams.y = nextScreenY - (sizePx / 2) - statusOffsetY
 
         try {
             wm.updateViewLayout(target, cParams)
@@ -237,12 +393,38 @@ class MainActivity : AppCompatActivity() {
         repeatRunnable = null
     }
 
+    private fun saveAreaSlot(slot: Int) {
+        syncAndRefreshFromCrosshair {
+            val xKey = if (slot == 1) "picked_x" else "picked_x2"
+            val yKey = if (slot == 1) "picked_y" else "picked_y2"
+            val hexKey = if (slot == 1) "picked_hex" else "picked_hex2"
+            val labelPrefix = if (slot == 1) "Area 1" else "Area 2"
+            val clipLabel = if (slot == 1) "color1" else "color2"
+
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putInt(xKey, lastPickedX)
+                .putInt(yKey, lastPickedY)
+                .putString(hexKey, lastPickedHex)
+                .apply()
+
+            try {
+                val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cb.setPrimaryClip(ClipData.newPlainText(clipLabel, lastPickedHex))
+            } catch (_: Throwable) {}
+
+            Toast.makeText(
+                this@MainActivity,
+                "$labelPrefix Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     private fun showFloatingPicker() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (floatingView != null) return
 
-        ScreenCaptureService.isPickerOverlayOpen = true
-        ScreenCaptureService.updatePickerTarget(lastPickedX, lastPickedY)
+        ScreenCaptureService.setPickerActive(true)
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -259,8 +441,14 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
+        val initialColor = try {
+            Color.parseColor(lastPickedHex)
+        } catch (_: Exception) {
+            Color.RED
+        }
+
         val swatchBg = GradientDrawable().apply {
-            setColor(Color.RED)
+            setColor(initialColor)
             cornerRadius = dp(6).toFloat()
             setStroke(dp(2), Color.WHITE)
         }
@@ -342,17 +530,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 setMargins(0, 0, dp(4), 0)
             }
-            setOnClickListener {
-                syncAndRefreshFromCrosshair()
-                getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
-                    .putInt("picked_x", lastPickedX)
-                    .putInt("picked_y", lastPickedY)
-                    .putString("picked_hex", lastPickedHex)
-                    .apply()
-                val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cb.setPrimaryClip(ClipData.newPlainText("color1", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Area 1 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
-            }
+            setOnClickListener { saveAreaSlot(1) }
         }
 
         val saveBtn2 = TextView(this).apply {
@@ -369,17 +547,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 setMargins(dp(4), 0, 0, 0)
             }
-            setOnClickListener {
-                syncAndRefreshFromCrosshair()
-                getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE).edit()
-                    .putInt("picked_x2", lastPickedX)
-                    .putInt("picked_y2", lastPickedY)
-                    .putString("picked_hex2", lastPickedHex)
-                    .apply()
-                val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cb.setPrimaryClip(ClipData.newPlainText("color2", lastPickedHex))
-                Toast.makeText(this@MainActivity, "Area 2 Tersimpan: ($lastPickedX, $lastPickedY) $lastPickedHex", Toast.LENGTH_SHORT).show()
-            }
+            setOnClickListener { saveAreaSlot(2) }
         }
 
         btnRow.addView(saveBtn1)
@@ -390,7 +558,7 @@ class MainActivity : AppCompatActivity() {
 
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else WindowManager.LayoutParams.TYPE_PHONE
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val params = WindowManager.LayoutParams(
             dp(215),
@@ -402,12 +570,11 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.TOP or Gravity.START
             x = dp(12)
             y = dp(100)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            }
+            applyCutoutMode(this)
         }
 
-        makeDraggable(panel, params, wm)
+        // Menggeser panel info tidak perlu memicu pembacaan warna crosshair
+        makeDraggable(panel, params, wm, refreshOnMove = false)
 
         wm.addView(panel, params)
         floatingView = panel
@@ -422,7 +589,7 @@ class MainActivity : AppCompatActivity() {
 
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else WindowManager.LayoutParams.TYPE_PHONE
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val dpadParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -434,9 +601,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.TOP or Gravity.START
             x = dp(240)
             y = dp(100)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            }
+            applyCutoutMode(this)
         }
 
         val container = LinearLayout(this).apply {
@@ -538,8 +703,8 @@ class MainActivity : AppCompatActivity() {
         container.addView(rowMid)
         container.addView(rowBot)
 
-        makeDraggable(centerDragBtn, dpadParams, wm, container)
-        makeDraggable(container, dpadParams, wm, container)
+        makeDraggable(centerDragBtn, dpadParams, wm, container, refreshOnMove = false)
+        makeDraggable(container, dpadParams, wm, container, refreshOnMove = false)
 
         wm.addView(container, dpadParams)
         dpadView = container
@@ -549,7 +714,8 @@ class MainActivity : AppCompatActivity() {
         touchView: View,
         layoutParams: WindowManager.LayoutParams,
         wm: WindowManager,
-        targetViewToUpdate: View = touchView
+        targetViewToUpdate: View = touchView,
+        refreshOnMove: Boolean = true
     ) {
         touchView.setOnTouchListener(object : View.OnTouchListener {
             var initX = 0
@@ -571,7 +737,9 @@ class MainActivity : AppCompatActivity() {
                         try {
                             wm.updateViewLayout(targetViewToUpdate, layoutParams)
                         } catch (_: Exception) {}
-                        syncAndRefreshFromCrosshair()
+                        if (refreshOnMove) {
+                            syncAndRefreshFromCrosshair()
+                        }
                         return true
                     }
                 }
@@ -581,29 +749,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showHollowCrosshair(wm: WindowManager) {
-        val sizePx = crosshairSizePx
+        val sizePx = crosshairSizePx()
         val target = object : View(this) {
             private val paintRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.YELLOW
                 style = Paint.Style.STROKE
-                strokeWidth = 3f
+                strokeWidth = dp(2).toFloat().coerceAtLeast(2f)
             }
             private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#00E676")
                 style = Paint.Style.STROKE
-                strokeWidth = 2.5f
+                strokeWidth = dp(2).toFloat().coerceAtLeast(2f)
             }
 
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
                 val cx = width / 2f
                 val cy = height / 2f
-                canvas.drawCircle(cx, cy, 28f, paintRing)
+                val ringRadius = (sizePx * 0.23f).coerceAtLeast(8f)
+                val gap = (sizePx * 0.18f).coerceAtLeast(6f)
+                canvas.drawCircle(cx, cy, ringRadius, paintRing)
 
-                canvas.drawLine(0f, cy, cx - 22f, cy, paintLine)
-                canvas.drawLine(cx + 22f, cy, width.toFloat(), cy, paintLine)
-                canvas.drawLine(cx, 0f, cx, cy - 22f, paintLine)
-                canvas.drawLine(cx, cy + 22f, cx, height.toFloat(), paintLine)
+                canvas.drawLine(0f, cy, cx - gap, cy, paintLine)
+                canvas.drawLine(cx + gap, cy, width.toFloat(), cy, paintLine)
+                canvas.drawLine(cx, 0f, cx, cy - gap, paintLine)
+                canvas.drawLine(cx, cy + gap, cx, height.toFloat(), paintLine)
             }
         }
 
@@ -616,16 +786,14 @@ class MainActivity : AppCompatActivity() {
             sizePx,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else WindowManager.LayoutParams.TYPE_PHONE,
+            else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
             flags,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = lastPickedX - sizePx / 2
             y = lastPickedY - sizePx / 2
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            }
+            applyCutoutMode(this)
         }
         cParamsRef = cParams
 
@@ -659,19 +827,27 @@ class MainActivity : AppCompatActivity() {
         crosshairView = target
     }
 
+    @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 1001 && resultCode == Activity.RESULT_OK && data != null) {
+        if (requestCode == REQ_MEDIA_PROJECTION && resultCode == Activity.RESULT_OK && data != null) {
             val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
-                putExtra("RESULT_CODE", resultCode)
-                putExtra("DATA", data)
+                putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(ScreenCaptureService.EXTRA_DATA, data)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
             } else {
                 startService(serviceIntent)
             }
-            statusText.postDelayed({ updateStatus() }, 500)
+            statusText.postDelayed({ updateStatus() }, 400)
+        } else if (requestCode == REQ_OVERLAY_PERMISSION) {
+            if (hasOverlayPermission()) {
+                showFloatingPicker()
+            } else {
+                Toast.makeText(this, "Izin overlay diperlukan untuk menampilkan alat bidik", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -679,8 +855,11 @@ class MainActivity : AppCompatActivity() {
         text = title
         setTextColor(Color.WHITE)
         setBackgroundColor(Color.parseColor(colorHex))
-        val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        lp.setMargins(0, 12, 0, 12)
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        lp.setMargins(0, dp(6), 0, dp(6))
         layoutParams = lp
         setOnClickListener { onClick() }
     }
