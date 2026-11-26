@@ -72,10 +72,11 @@ class ScreenCaptureService : Service() {
         private val stateLock = Object()
         private val frameLock = Object()
 
+        private var appContextRef: Context? = null
         private var mediaProjection: MediaProjection? = null
+        private var projectionCallback: MediaProjection.Callback? = null
         private var virtualDisplay: VirtualDisplay? = null
         private var imageReader: ImageReader? = null
-        private var latestPickerImage: Image? = null
 
         private var frameThread: HandlerThread? = null
         private var frameHandler: Handler? = null
@@ -104,7 +105,7 @@ class ScreenCaptureService : Service() {
                 pickerActiveFlag = active
                 if (active) {
                     if (!pickerHoldsReader && mediaProjection != null && virtualDisplay != null) {
-                        if (attachReaderLocked(maxImages = 3) != null) {
+                        if (attachReaderLocked(maxImages = 2) != null) {
                             activeReadersCount++
                             pickerHoldsReader = true
                         }
@@ -112,7 +113,6 @@ class ScreenCaptureService : Service() {
                 } else {
                     if (pickerHoldsReader) {
                         pickerHoldsReader = false
-                        closePickerImageLocked()
                         releaseReaderLocked()
                     }
                 }
@@ -143,12 +143,16 @@ class ScreenCaptureService : Service() {
                     useColor2 = false
                 }
                 COLOR_MODE_PICK_ONE -> {
-                    if (pickOneTarget == PICK_ONE_COLOR_2) {
-                        useColor1 = false
-                        useColor2 = true
-                    } else {
-                        useColor1 = true
-                        useColor2 = false
+                    when (pickOneTarget) {
+                        PICK_ONE_COLOR_2 -> {
+                            useColor1 = false
+                            useColor2 = true
+                        }
+                        PICK_ONE_COLOR_1 -> {
+                            useColor1 = true
+                            useColor2 = false
+                        }
+                        else -> return EvalOutcome(EvalStatus.ERR_INVALID_CONFIG, 0, "INVALID_PICK_ONE_TARGET")
                     }
                 }
                 COLOR_MODE_DUAL_SIMULTANEOUS -> {
@@ -174,7 +178,7 @@ class ScreenCaptureService : Service() {
                 curRot = screenRotation
                 prevFrameSeq = synchronized(frameLock) { frameCounter }
 
-                if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) == null) {
+                if (attachReaderLocked(maxImages = 2) == null) {
                     return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "READER_ATTACH_FAILED")
                 }
                 activeReadersCount++
@@ -196,6 +200,7 @@ class ScreenCaptureService : Service() {
                                 frameLock.wait(waitMs)
                             } catch (_: InterruptedException) {
                                 Thread.currentThread().interrupt()
+                                return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "INTERRUPTED")
                             }
                         }
                         prevFrameSeq = frameCounter
@@ -260,7 +265,7 @@ class ScreenCaptureService : Service() {
                 }
                 prevSeq = synchronized(frameLock) { frameCounter }
                 if (imageReader == null) {
-                    if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) == null) {
+                    if (attachReaderLocked(maxImages = 2) == null) {
                         return null
                     }
                     activeReadersCount++
@@ -272,26 +277,6 @@ class ScreenCaptureService : Service() {
                 val deadlineNanos = System.nanoTime() + (SINGLE_FRAME_WAIT_MS * 1_000_000L)
                 var img: Image? = acquireFreshImageLocked()
 
-                while (img == null && pickerHoldsReader && latestPickerImage != null) {
-                    val rem = deadlineNanos - System.nanoTime()
-                    if (rem <= (SINGLE_FRAME_WAIT_MS * 500_000L)) {
-                        img = latestPickerImage
-                    } else {
-                        synchronized(frameLock) {
-                            if (frameCounter == prevSeq) {
-                                try {
-                                    frameLock.wait(20L)
-                                } catch (_: InterruptedException) {
-                                    Thread.currentThread().interrupt()
-                                }
-                            }
-                            prevSeq = frameCounter
-                        }
-                        img = acquireFreshImageLocked()
-                    }
-                    if (img != null) break
-                }
-
                 while (img == null) {
                     val rem = deadlineNanos - System.nanoTime()
                     if (rem <= 0L) break
@@ -301,6 +286,7 @@ class ScreenCaptureService : Service() {
                                 frameLock.wait(25L)
                             } catch (_: InterruptedException) {
                                 Thread.currentThread().interrupt()
+                                return null
                             }
                         }
                         prevSeq = frameCounter
@@ -309,13 +295,10 @@ class ScreenCaptureService : Service() {
                 }
 
                 val target = img ?: return null
-                val shouldClose = !(pickerHoldsReader && target === latestPickerImage)
                 return try {
                     readRgbHexFromImage(target, x, y)
                 } finally {
-                    if (shouldClose) {
-                        try { target.close() } catch (_: Throwable) {}
-                    }
+                    try { target.close() } catch (_: Throwable) {}
                 }
             } finally {
                 if (tempReader) {
@@ -361,12 +344,12 @@ class ScreenCaptureService : Service() {
 
             when (rotDiff) {
                 1 -> {
-                    mappedX = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufW) / srcH).toInt()
-                    mappedY = ((safeX.toLong() * bufH) / srcW).toInt()
-                }
-                3 -> {
                     mappedX = ((safeY.toLong() * bufW) / srcH).toInt()
                     mappedY = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufH) / srcW).toInt()
+                }
+                3 -> {
+                    mappedX = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufW) / srcH).toInt()
+                    mappedY = ((safeX.toLong() * bufH) / srcW).toInt()
                 }
                 2 -> {
                     mappedX = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufW) / srcW).toInt()
@@ -398,20 +381,11 @@ class ScreenCaptureService : Service() {
 
         private fun acquireFreshImageLocked(): Image? {
             val reader = synchronized(stateLock) { imageReader } ?: return null
-            val fresh = try {
+            return try {
                 reader.acquireLatestImage()
             } catch (_: Throwable) {
                 null
             }
-            if (fresh != null) {
-                synchronized(stateLock) {
-                    if (pickerHoldsReader) {
-                        closePickerImageLocked()
-                        latestPickerImage = fresh
-                    }
-                }
-            }
-            return fresh
         }
 
         private fun readRgbHexFromImage(img: Image, x: Int, y: Int): String? {
@@ -483,8 +457,39 @@ class ScreenCaptureService : Service() {
             buf.order(ByteOrder.LITTLE_ENDIAN)
             val limit = buf.limit()
 
+            // Jalur cepat: Mode 1 dengan koordinat sama dipindai dalam satu sapuan (single-pass)
+            if (useColor1 && useColor2 && cx1 == cx2 && cy1 == cy2) {
+                val both = countMatchesDualSameBoxRowMajor(
+                    buf, limit, w, h, rs, ps,
+                    cx1, cy1, radius, step,
+                    rgb1, rgb2, tolerance, minMatches, colorLogic
+                )
+                val matched = if (colorLogic == LOGIC_OR) {
+                    both.first >= minMatches || both.second >= minMatches
+                } else {
+                    both.first >= minMatches && both.second >= minMatches
+                }
+                val count = if (colorLogic == LOGIC_OR) {
+                    maxOf(both.first, both.second)
+                } else {
+                    minOf(both.first, both.second)
+                }
+                return if (matched) {
+                    EvalOutcome(EvalStatus.MATCHED, count, "MATCHED")
+                } else {
+                    EvalOutcome(EvalStatus.NOT_MATCHED, count, "NOT_MATCHED")
+                }
+            }
+
             val count1 = if (useColor1) {
-                countMatchesInBoxRowMajor(buf, limit, w, h, rs, ps, cx1, cy1, radius, step, rgb1, tolerance, minMatches)
+                val c = countMatchesInBoxRowMajor(buf, limit, w, h, rs, ps, cx1, cy1, radius, step, rgb1, tolerance, minMatches)
+                if (useColor2 && colorLogic == LOGIC_AND && c < minMatches) {
+                    return EvalOutcome(EvalStatus.NOT_MATCHED, c, "NOT_MATCHED")
+                }
+                if (useColor2 && colorLogic == LOGIC_OR && c >= minMatches) {
+                    return EvalOutcome(EvalStatus.MATCHED, c, "MATCHED")
+                }
+                c
             } else {
                 0
             }
@@ -521,6 +526,115 @@ class ScreenCaptureService : Service() {
             }
         }
 
+        private fun isColorMatch(
+            r: Int, g: Int, b: Int,
+            tr: Int, tg: Int, tb: Int,
+            rMin: Int, rMax: Int,
+            gMin: Int, gMax: Int,
+            bMin: Int, bMax: Int,
+            maxDistSq: Int
+        ): Boolean {
+            if (r !in rMin..rMax || g !in gMin..gMax || b !in bMin..bMax) return false
+            val dr = r - tr
+            val dg = g - tg
+            val db = b - tb
+            return (dr * dr + dg * dg + db * db) <= maxDistSq
+        }
+
+        private fun countMatchesDualSameBoxRowMajor(
+            buf: ByteBuffer,
+            limit: Int,
+            width: Int,
+            height: Int,
+            rowStride: Int,
+            pixelStride: Int,
+            centerX: Int,
+            centerY: Int,
+            radius: Int,
+            step: Int,
+            targetRgb1: Int,
+            targetRgb2: Int,
+            tolerance: Int,
+            minMatches: Int,
+            colorLogic: Int
+        ): Pair<Int, Int> {
+            val tr1 = (targetRgb1 ushr 16) and 0xFF
+            val tg1 = (targetRgb1 ushr 8) and 0xFF
+            val tb1 = targetRgb1 and 0xFF
+
+            val tr2 = (targetRgb2 ushr 16) and 0xFF
+            val tg2 = (targetRgb2 ushr 8) and 0xFF
+            val tb2 = targetRgb2 and 0xFF
+
+            val rMin1 = tr1 - tolerance; val rMax1 = tr1 + tolerance
+            val gMin1 = tg1 - tolerance; val gMax1 = tg1 + tolerance
+            val bMin1 = tb1 - tolerance; val bMax1 = tb1 + tolerance
+
+            val rMin2 = tr2 - tolerance; val rMax2 = tr2 + tolerance
+            val gMin2 = tg2 - tolerance; val gMax2 = tg2 + tolerance
+            val bMin2 = tb2 - tolerance; val bMax2 = tb2 + tolerance
+
+            val left = (centerX - radius).coerceIn(0, width - 1)
+            val right = (centerX + radius).coerceIn(0, width - 1)
+            val top = (centerY - radius).coerceIn(0, height - 1)
+            val bottom = (centerY + radius).coerceIn(0, height - 1)
+
+            val maxDistSq = tolerance * tolerance
+
+            var m1 = 0
+            var m2 = 0
+            var y = top
+            while (y <= bottom) {
+                val rowBase = y * rowStride
+                var x = left
+                while (x <= right) {
+                    val off = rowBase + x * pixelStride
+                    if (off >= 0 && off + 2 < limit) {
+                        val r: Int
+                        val g: Int
+                        val b: Int
+                        if (off + 3 < limit) {
+                            val pixel = buf.getInt(off)
+                            r = pixel and 0xFF
+                            g = (pixel ushr 8) and 0xFF
+                            b = (pixel ushr 16) and 0xFF
+                        } else {
+                            r = buf.get(off).toInt() and 0xFF
+                            g = buf.get(off + 1).toInt() and 0xFF
+                            b = buf.get(off + 2).toInt() and 0xFF
+                        }
+
+                        if (isColorMatch(r, g, b, tr1, tg1, tb1, rMin1, rMax1, gMin1, gMax1, bMin1, bMax1, maxDistSq)) {
+                            m1++
+                        }
+                        if (isColorMatch(r, g, b, tr2, tg2, tb2, rMin2, rMax2, gMin2, gMax2, bMin2, bMax2, maxDistSq)) {
+                            m2++
+                        }
+
+                        if (colorLogic == LOGIC_OR && (m1 >= minMatches || m2 >= minMatches)) {
+                            return Pair(m1, m2)
+                        }
+                        if (colorLogic == LOGIC_AND && m1 >= minMatches && m2 >= minMatches) {
+                            return Pair(m1, m2)
+                        }
+                    }
+                    if (x == right) {
+                        x = right + 1
+                    } else {
+                        val nextX = x + step
+                        x = if (nextX > right) right else nextX
+                    }
+                }
+                if (y == bottom) {
+                    y = bottom + 1
+                } else {
+                    val nextY = y + step
+                    y = if (nextY > bottom) bottom else nextY
+                }
+            }
+            return Pair(m1, m2)
+        }
+
         private fun countMatchesInBoxRowMajor(
             buf: ByteBuffer,
             limit: Int,
@@ -552,7 +666,7 @@ class ScreenCaptureService : Service() {
             val top = (centerY - radius).coerceIn(0, height - 1)
             val bottom = (centerY + radius).coerceIn(0, height - 1)
 
-            val maxChannelDistSq = tolerance * tolerance * 3
+            val maxDistSq = tolerance * tolerance
 
             var matches = 0
             var y = top
@@ -576,19 +690,19 @@ class ScreenCaptureService : Service() {
                             b = buf.get(off + 2).toInt() and 0xFF
                         }
 
-                        if (r in rMin..rMax && g in gMin..gMax && b in bMin..bMax) {
-                            val dr = r - tr
-                            val dg = g - tg
-                            val db = b - tb
-                            if ((dr * dr + dg * dg + db * db) <= maxChannelDistSq) {
-                                matches++
-                                if (matches >= minMatches) {
-                                    return matches
-                                }
+                        if (isColorMatch(r, g, b, tr, tg, tb, rMin, rMax, gMin, gMax, bMin, bMax, maxDistSq)) {
+                            matches++
+                            if (matches >= minMatches) {
+                                return matches
                             }
                         }
                     }
-                    x += step
+                    if (x == right) {
+                        x = right + 1
+                    } else {
+                        val nextX = x + step
+                        x = if (nextX > right) right else nextX
+                    }
                 }
                 if (y == bottom) {
                     y = bottom + 1
@@ -633,16 +747,7 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        private fun closePickerImageLocked() {
-            val img = latestPickerImage
-            latestPickerImage = null
-            if (img != null) {
-                try { img.close() } catch (_: Throwable) {}
-            }
-        }
-
         private fun detachAndCloseReaderLocked() {
-            closePickerImageLocked()
             try { virtualDisplay?.setSurface(null) } catch (_: Throwable) {}
             val reader = imageReader
             imageReader = null
@@ -666,6 +771,7 @@ class ScreenCaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        appContextRef = applicationContext
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         displayManager?.registerDisplayListener(displayListener, mainHandler)
     }
@@ -709,13 +815,14 @@ class ScreenCaptureService : Service() {
 
     private fun readDisplayMetrics(): Pair<Pair<Int, Int>, Pair<Int, Int>> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val dm = displayManager ?: (getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
         val densityDpi = resources.configuration.densityDpi.coerceAtLeast(120)
-        @Suppress("DEPRECATION")
         val rotation = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                display?.rotation ?: wm.defaultDisplay.rotation
+                dm?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
             } else {
-                wm.defaultDisplay.rotation
+                @Suppress("DEPRECATION")
+                dm?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: wm.defaultDisplay.rotation
             }
         } catch (_: Throwable) {
             Surface.ROTATION_0
@@ -763,7 +870,7 @@ class ScreenCaptureService : Service() {
             } catch (_: Throwable) {}
 
             if (hadReader && (pickerHoldsReader || prevCount > 0)) {
-                if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) != null) {
+                if (attachReaderLocked(maxImages = 2) != null) {
                     activeReadersCount = maxOf(prevCount, if (pickerHoldsReader) 1 else 0)
                 }
             }
@@ -787,17 +894,19 @@ class ScreenCaptureService : Service() {
             return false
         }
 
-        projection.registerCallback(object : MediaProjection.Callback() {
+        val cb = object : MediaProjection.Callback() {
             override fun onStop() {
                 shutdownServiceCompletely()
             }
 
             override fun onCapturedContentResize(width: Int, height: Int) {
-                val currentDpi = resources.configuration.densityDpi.coerceAtLeast(120)
-                val currentRot = screenRotation
+                val (_, metaNow) = readDisplayMetrics()
+                val currentDpi = metaNow.first
+                val currentRot = metaNow.second
                 applyResize(width, height, currentDpi, currentRot)
             }
-        }, handler)
+        }
+        projection.registerCallback(cb, handler)
 
         val vd = projection.createVirtualDisplay(
             "FastAutoColorEngine",
@@ -807,6 +916,7 @@ class ScreenCaptureService : Service() {
             null,
             handler
         ) ?: run {
+            try { projection.unregisterCallback(cb) } catch (_: Throwable) {}
             try { projection.stop() } catch (_: Throwable) {}
             try { thread.quitSafely() } catch (_: Throwable) {}
             return false
@@ -819,11 +929,12 @@ class ScreenCaptureService : Service() {
             screenRotation = rot
             frameThread = thread
             frameHandler = handler
+            projectionCallback = cb
             mediaProjection = projection
             virtualDisplay = vd
 
             if (pickerActiveFlag && !pickerHoldsReader) {
-                if (attachReaderLocked(maxImages = 3) != null) {
+                if (attachReaderLocked(maxImages = 2) != null) {
                     activeReadersCount++
                     pickerHoldsReader = true
                 }
@@ -849,6 +960,7 @@ class ScreenCaptureService : Service() {
         val threadToQuit: HandlerThread?
         val vdToRelease: VirtualDisplay?
         val mpToStop: MediaProjection?
+        val cbToUnregister: MediaProjection.Callback?
 
         synchronized(stateLock) {
             activeReadersCount = 0
@@ -857,6 +969,8 @@ class ScreenCaptureService : Service() {
 
             vdToRelease = virtualDisplay
             virtualDisplay = null
+            cbToUnregister = projectionCallback
+            projectionCallback = null
             mpToStop = mediaProjection
             mediaProjection = null
             threadToQuit = frameThread
@@ -869,6 +983,9 @@ class ScreenCaptureService : Service() {
         }
 
         try { vdToRelease?.release() } catch (_: Throwable) {}
+        if (mpToStop != null && cbToUnregister != null) {
+            try { mpToStop.unregisterCallback(cbToUnregister) } catch (_: Throwable) {}
+        }
         try { mpToStop?.stop() } catch (_: Throwable) {}
         try { threadToQuit?.quitSafely() } catch (_: Throwable) {}
     }
@@ -904,6 +1021,7 @@ class ScreenCaptureService : Service() {
     override fun onDestroy() {
         try { displayManager?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
         stopProjection()
+        appContextRef = null
         super.onDestroy()
     }
 
