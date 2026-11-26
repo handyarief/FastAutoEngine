@@ -14,6 +14,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -161,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area One-Shot untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan flow Automate agar overlay tidak menghalangi layar dan sesi kembali True-Idle."
+            text = "Mesin Pemindai Area One-Shot (Opsi A) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan flow Automate agar overlay tidak menghalangi layar dan sesi kembali True-Idle."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, dp(10))
@@ -198,15 +199,9 @@ class MainActivity : AppCompatActivity() {
             val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 action = ScreenCaptureService.ACTION_STOP_SERVICE
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try {
-                    startForegroundService(stopIntent)
-                } catch (_: Throwable) {
-                    stopService(stopIntent)
-                }
-            } else {
+            try {
                 stopService(stopIntent)
-            }
+            } catch (_: Throwable) {}
             statusText.postDelayed({ updateStatus() }, 200)
             Toast.makeText(this, "Mesin pembaca warna dimatikan (True-Idle)", Toast.LENGTH_SHORT).show()
         })
@@ -217,8 +212,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchScreenCaptureConsent() {
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        @Suppress("DEPRECATION")
-        val intent = mpManager.createScreenCaptureIntent()
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            mpManager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+        } else {
+            @Suppress("DEPRECATION")
+            mpManager.createScreenCaptureIntent()
+        }
         @Suppress("DEPRECATION")
         startActivityForResult(intent, REQ_MEDIA_PROJECTION)
     }
@@ -263,7 +262,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
         statusText.text = if (colorOk) {
-            "Mesin Area RAM: ✅ AKTIF (One-Shot, True-Idle saat tidak dipanggil)"
+            "Mesin Area RAM: ✅ AKTIF (One-Shot Opsi A, True-Idle saat tidak dipanggil)"
         } else {
             "Mesin Area RAM: ❌ MATI"
         }
@@ -603,8 +602,11 @@ class MainActivity : AppCompatActivity() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+        val (physW, physH) = getExactScreenSize()
+        val panelW = dp(215).coerceAtMost((physW - dp(24)).coerceAtLeast(dp(140)))
+
         val params = WindowManager.LayoutParams(
-            dp(215),
+            panelW,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
@@ -612,7 +614,7 @@ class MainActivity : AppCompatActivity() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = dp(12)
-            y = dp(100)
+            y = dp(100).coerceAtMost((physH - dp(120)).coerceAtLeast(0))
             applyCutoutMode(this)
         }
 
@@ -633,6 +635,13 @@ class MainActivity : AppCompatActivity() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+        val (physW, physH) = getExactScreenSize()
+        val btnSize = dp(32)
+        val gap = dp(2)
+        val approxDpadW = (btnSize * 3) + (gap * 6) + dp(12)
+        val safeX = (physW - approxDpadW - dp(8)).coerceAtLeast(dp(8))
+        val safeY = dp(100).coerceAtMost((physH - dp(150)).coerceAtLeast(dp(8)))
+
         val dpadParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -641,8 +650,8 @@ class MainActivity : AppCompatActivity() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(240)
-            y = dp(100)
+            x = safeX
+            y = safeY
             applyCutoutMode(this)
         }
 
@@ -656,9 +665,6 @@ class MainActivity : AppCompatActivity() {
                 setStroke(dp(1).coerceAtLeast(2), Color.parseColor("#00E676"))
             }
         }
-
-        val btnSize = dp(32)
-        val gap = dp(2)
 
         fun createDirBtn(symbol: String, dx: Int, dy: Int): TextView {
             return TextView(this).apply {
@@ -835,6 +841,12 @@ class MainActivity : AppCompatActivity() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
+        val (physW, physH) = getExactScreenSize()
+        val bufW = if (ScreenCaptureService.screenWidth > 0) ScreenCaptureService.screenWidth else physW
+        val bufH = if (ScreenCaptureService.screenHeight > 0) ScreenCaptureService.screenHeight else physH
+        val initPhysX = ((lastPickedX.toLong() * physW) / bufW).toInt()
+        val initPhysY = ((lastPickedY.toLong() * physH) / bufH).toInt()
+
         val cParams = WindowManager.LayoutParams(
             sizePx,
             sizePx,
@@ -845,8 +857,8 @@ class MainActivity : AppCompatActivity() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = lastPickedX - sizePx / 2
-            y = lastPickedY - sizePx / 2
+            x = initPhysX - sizePx / 2
+            y = initPhysY - sizePx / 2
             applyCutoutMode(this)
         }
         cParamsRef = cParams
