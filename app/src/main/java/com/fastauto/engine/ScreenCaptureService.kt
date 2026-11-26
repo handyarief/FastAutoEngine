@@ -8,9 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
+import android.hardware.display.MediaProjectionConfig
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
@@ -24,6 +24,7 @@ import android.os.Looper
 import android.os.Process
 import android.util.DisplayMetrics
 import android.view.Display
+import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import java.nio.ByteBuffer
@@ -31,244 +32,331 @@ import java.nio.ByteOrder
 
 class ScreenCaptureService : Service() {
 
-    enum class EvalResult {
+    enum class EvalStatus {
         MATCHED,
         NOT_MATCHED,
-        ENGINE_NOT_READY,
-        CAPTURE_FAILED
+        ERR_ENGINE_NOT_READY,
+        ERR_CAPTURE_FAILED,
+        ERR_INVALID_CONFIG
     }
 
+    data class EvalOutcome(
+        val status: EvalStatus,
+        val matchedCount: Int = 0,
+        val detail: String = ""
+    )
+
     companion object {
-        const val ACTION_STOP_SERVICE = "STOP_SERVICE"
-        const val EXTRA_RESULT_CODE = "RESULT_CODE"
-        const val EXTRA_DATA = "DATA"
+        const val ACTION_STOP_SERVICE = "com.fastauto.engine.action.STOP_SERVICE"
+        const val EXTRA_RESULT_CODE = "com.fastauto.engine.extra.RESULT_CODE"
+        const val EXTRA_DATA = "com.fastauto.engine.extra.DATA"
+
+        // 3 Mode Pemilihan Warna:
+        // 1 = Dua Warna Sekaligus (pada area/koordinat yang sama atau terkonfigurasi dengan logika AND/OR)
+        // 2 = Satu Warna (Warna 1 saja)
+        // 3 = Pilih Salah Satu Warna (pilih Warna 1 saja atau Warna 2 saja sesuai konfigurasi)
+        const val COLOR_MODE_DUAL_SIMULTANEOUS = 1
+        const val COLOR_MODE_SINGLE = 2
+        const val COLOR_MODE_PICK_ONE = 3
+
+        const val PICK_ONE_COLOR_1 = 1
+        const val PICK_ONE_COLOR_2 = 2
+
         const val LOGIC_AND = 0
         const val LOGIC_OR = 1
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "fastauto_capture_channel"
-        private const val INITIAL_FRAME_WAIT_MS = 400L
-        private const val MAX_WAIT_TIMEOUT_MS = 5000L
-
-        @Volatile
-        var instance: ScreenCaptureService? = null
+        private const val SINGLE_FRAME_WAIT_MS = 120L
 
         @Volatile var screenWidth: Int = 0
         @Volatile var screenHeight: Int = 0
         @Volatile var screenDensity: Int = 0
+        @Volatile var screenRotation: Int = Surface.ROTATION_0
 
-        private val captureLock = Object()
-        private val frameSignal = Object()
+        private val stateLock = Object()
+        private val frameLock = Object()
 
         private var mediaProjection: MediaProjection? = null
         private var virtualDisplay: VirtualDisplay? = null
         private var imageReader: ImageReader? = null
-        private var pickerCacheImage: Image? = null
+        private var latestPickerImage: Image? = null
 
-        private var bgThread: HandlerThread? = null
-        private var bgHandler: Handler? = null
+        private var frameThread: HandlerThread? = null
+        private var frameHandler: Handler? = null
         private val mainHandler = Handler(Looper.getMainLooper())
 
-        private var activeSessions: Int = 0
-        private var pickerRequested: Boolean = false
-        private var pickerSessionHeld: Boolean = false
-        private var hasCapturedContentResize: Boolean = false
-        private var frameSeq: Long = 0L
+        private var activeReadersCount: Int = 0
+        private var pickerActiveFlag: Boolean = false
+        private var pickerHoldsReader: Boolean = false
+        private var frameCounter: Long = 0L
 
-        private val onDemandFrameListener = ImageReader.OnImageAvailableListener {
-            synchronized(frameSignal) {
-                frameSeq++
-                frameSignal.notifyAll()
+        private val frameAvailableListener = ImageReader.OnImageAvailableListener {
+            synchronized(frameLock) {
+                frameCounter++
+                frameLock.notifyAll()
             }
         }
 
         fun isReady(): Boolean {
-            synchronized(captureLock) {
-                return mediaProjection != null && virtualDisplay != null
+            synchronized(stateLock) {
+                return mediaProjection != null && virtualDisplay != null && screenWidth > 0 && screenHeight > 0
             }
         }
 
         /**
-         * Menjaga sesi pembacaan tetap hangat HANYA selama overlay Alat Bidik terbuka
-         * agar proses geser bidik mulus. Saat Alat Bidik ditutup (false), Surface langsung
-         * dilepas dan ImageReader ditutup kembali ke Strict True-Idle (0 MB Graphics Buffer).
+         * Mengaktifkan reader khusus overlay Alat Bidik saat dibuka.
+         * Saat ditutup (false), surface dilepas dan reader ditutup agar kembali True-Idle.
          */
         fun setPickerActive(active: Boolean) {
-            synchronized(captureLock) {
-                pickerRequested = active
+            synchronized(stateLock) {
+                pickerActiveFlag = active
                 if (active) {
-                    if (!pickerSessionHeld && mediaProjection != null && virtualDisplay != null) {
-                        if (ensureReaderAttachedLocked(maxImages = 3) != null) {
-                            activeSessions++
-                            pickerSessionHeld = true
+                    if (!pickerHoldsReader && mediaProjection != null && virtualDisplay != null) {
+                        if (attachReaderLocked(maxImages = 3) != null) {
+                            activeReadersCount++
+                            pickerHoldsReader = true
                         }
                     }
                 } else {
-                    if (pickerSessionHeld) {
-                        pickerSessionHeld = false
-                        closePickerCacheLocked()
-                        releaseSessionLocked()
+                    if (pickerHoldsReader) {
+                        pickerHoldsReader = false
+                        closePickerImageLocked()
+                        releaseReaderLocked()
                     }
                 }
             }
         }
 
         /**
-         * Evaluasi warna On-Demand khusus area ROI (1 warna atau 2 warna AND/OR).
-         * Pola: Strict True-Idle -> Pasang Surface -> 1 Frame Segar -> Pindai ROI -> Tutup & Idle.
+         * Eksekusi ONE-SHOT murni:
+         * 1. Pasang reader jika belum aktif (True-Idle -> Aktif).
+         * 2. Ambil 1 frame segar (tanpa loop polling berulang).
+         * 3. Pindai HANYA area ROI sesuai mode warna yang dipilih.
+         * 4. Lepas reader kembali ke True-Idle (jika tidak sedang dipakai picker).
          */
-        fun evaluateAreaOnDemand(
+        fun evaluateOneShot(
+            colorMode: Int,
+            pickOneTarget: Int,
+            colorLogic: Int,
             x1: Int, y1: Int, rgb1: Int,
-            useColor2: Boolean, colorLogic: Int,
             x2: Int, y2: Int, rgb2: Int,
-            radius: Int, step: Int, tolerance: Int,
-            timeoutMs: Long
-        ): EvalResult {
-            val rad = radius.coerceIn(1, 500)
-            val stp = step.coerceIn(1, 20)
+            refWidth: Int, refHeight: Int, refRotation: Int,
+            radius: Int, step: Int, tolerance: Int, minMatches: Int
+        ): EvalOutcome {
+            val activeMode = when (colorMode) {
+                COLOR_MODE_DUAL_SIMULTANEOUS -> COLOR_MODE_DUAL_SIMULTANEOUS
+                COLOR_MODE_SINGLE -> COLOR_MODE_SINGLE
+                COLOR_MODE_PICK_ONE -> COLOR_MODE_PICK_ONE
+                else -> return EvalStatus.ERR_INVALID_CONFIG.let {
+                    EvalOutcome(it, 0, "INVALID_COLOR_MODE")
+                }
+            }
+
+            val useColor1: Boolean
+            val useColor2: Boolean
+            when (activeMode) {
+                COLOR_MODE_SINGLE -> {
+                    useColor1 = true
+                    useColor2 = false
+                }
+                COLOR_MODE_PICK_ONE -> {
+                    if (pickOneTarget == PICK_ONE_COLOR_2) {
+                        useColor1 = false
+                        useColor2 = true
+                    } else {
+                        useColor1 = true
+                        useColor2 = false
+                    }
+                }
+                COLOR_MODE_DUAL_SIMULTANEOUS -> {
+                    useColor1 = true
+                    useColor2 = true
+                }
+                else -> return EvalOutcome(EvalStatus.ERR_INVALID_CONFIG, 0, "INVALID_COLOR_MODE")
+            }
+
+            val rad = radius.coerceIn(1, 600)
+            val stp = step.coerceIn(1, 24)
             val tol = tolerance.coerceIn(0, 255)
-            val safeTimeout = timeoutMs.coerceIn(0L, MAX_WAIT_TIMEOUT_MS)
+            val reqMatches = minMatches.coerceIn(1, 500)
 
-            var sessionAcquired = false
-            var seqBeforeAttach = 0L
-            var startedFromIdle = false
+            var acquiredHere = false
+            var prevFrameSeq = 0L
+            var curW: Int
+            var curH: Int
+            var curRot: Int
 
-            synchronized(captureLock) {
-                if (mediaProjection == null || virtualDisplay == null) {
-                    return EvalResult.ENGINE_NOT_READY
+            synchronized(stateLock) {
+                if (mediaProjection == null || virtualDisplay == null || screenWidth <= 0 || screenHeight <= 0) {
+                    return EvalOutcome(EvalStatus.ERR_ENGINE_NOT_READY, 0, "ENGINE_NOT_READY")
                 }
-                startedFromIdle = (imageReader == null)
-                seqBeforeAttach = synchronized(frameSignal) { frameSeq }
-                if (ensureReaderAttachedLocked(maxImages = if (pickerSessionHeld) 3 else 2) == null) {
-                    return EvalResult.ENGINE_NOT_READY
+                curW = screenWidth
+                curH = screenHeight
+                curRot = screenRotation
+                prevFrameSeq = synchronized(frameLock) { frameCounter }
+
+                if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) == null) {
+                    return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "READER_ATTACH_FAILED")
                 }
-                activeSessions++
-                sessionAcquired = true
+                activeReadersCount++
+                acquiredHere = true
             }
 
             try {
-                val now = System.nanoTime()
-                val waitWindowMs = if (safeTimeout > 0L) safeTimeout else INITIAL_FRAME_WAIT_MS
-                val deadlineNanos = now + (waitWindowMs * 1_000_000L)
+                // Tunggu hingga tersedia frame baru setelah surface terpasang (maksimal 1 siklus tunggu singkat)
+                val deadlineNanos = System.nanoTime() + (SINGLE_FRAME_WAIT_MS * 1_000_000L)
+                var image: Image? = acquireFreshImageLocked()
 
-                var lastSeenSeq = seqBeforeAttach
-                var evaluatedAtLeastOneFrame = false
+                while (image == null) {
+                    val remNanos = deadlineNanos - System.nanoTime()
+                    if (remNanos <= 0L) break
 
-                while (true) {
-                    val scanOutcome = acquireAndEvaluateOnce(
-                        x1, y1, rgb1,
-                        useColor2, colorLogic,
-                        x2, y2, rgb2,
-                        rad, stp, tol,
-                        allowPickerCacheFallback = !startedFromIdle && pickerSessionHeld && !evaluatedAtLeastOneFrame
-                    )
-
-                    when (scanOutcome) {
-                        ScanStep.MATCHED -> return EvalResult.MATCHED
-                        ScanStep.ENGINE_STOPPED -> return EvalResult.ENGINE_NOT_READY
-                        ScanStep.NOT_MATCHED -> {
-                            evaluatedAtLeastOneFrame = true
-                            if (safeTimeout <= 0L) {
-                                return EvalResult.NOT_MATCHED
-                            }
-                        }
-                        ScanStep.NO_IMAGE_YET -> {
-                            // Tunggu frame segar dari SurfaceFlinger hingga deadline
-                        }
-                    }
-
-                    val remainingNanos = deadlineNanos - System.nanoTime()
-                    if (remainingNanos <= 0L) {
-                        return if (evaluatedAtLeastOneFrame) {
-                            EvalResult.NOT_MATCHED
-                        } else {
-                            EvalResult.CAPTURE_FAILED
-                        }
-                    }
-
-                    val waitMs = ((remainingNanos + 999_999L) / 1_000_000L).coerceIn(1L, 50L)
-                    synchronized(frameSignal) {
-                        if (frameSeq == lastSeenSeq) {
+                    val waitMs = ((remNanos + 999_999L) / 1_000_000L).coerceIn(1L, 30L)
+                    synchronized(frameLock) {
+                        if (frameCounter == prevFrameSeq) {
                             try {
-                                frameSignal.wait(waitMs)
+                                frameLock.wait(waitMs)
                             } catch (_: InterruptedException) {
                                 Thread.currentThread().interrupt()
-                                return if (evaluatedAtLeastOneFrame) {
-                                    EvalResult.NOT_MATCHED
-                                } else {
-                                    EvalResult.CAPTURE_FAILED
-                                }
+                                break
                             }
                         }
-                        lastSeenSeq = frameSeq
+                        prevFrameSeq = frameCounter
                     }
+                    image = acquireFreshImageLocked()
+                }
+
+                if (image == null) {
+                    return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "NO_FRESH_FRAME")
+                }
+
+                return try {
+                    val imgW = image.width
+                    val imgH = image.height
+                    if (imgW <= 0 || imgH <= 0) {
+                        EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "INVALID_IMAGE_SIZE")
+                    } else {
+                        val mapped1 = mapCoordinateToCurrentBuffer(
+                            x1, y1, refWidth, refHeight, refRotation,
+                            imgW, imgH, curRot
+                        )
+                        val mapped2 = mapCoordinateToCurrentBuffer(
+                            x2, y2, refWidth, refHeight, refRotation,
+                            imgW, imgH, curRot
+                        )
+                        val mappedRad = mapRadiusToCurrentBuffer(
+                            rad, refWidth, refHeight, imgW, imgH
+                        )
+
+                        evaluateRoiOnce(
+                            image = image,
+                            useColor1 = useColor1,
+                            useColor2 = useColor2,
+                            colorLogic = colorLogic,
+                            cx1 = mapped1.first, cy1 = mapped1.second, rgb1 = rgb1,
+                            cx2 = mapped2.first, cy2 = mapped2.second, rgb2 = rgb2,
+                            radius = mappedRad,
+                            step = stp,
+                            tolerance = tol,
+                            minMatches = reqMatches
+                        )
+                    }
+                } finally {
+                    try { image.close() } catch (_: Throwable) {}
                 }
             } finally {
-                if (sessionAcquired) {
-                    synchronized(captureLock) {
-                        releaseSessionLocked()
+                if (acquiredHere) {
+                    synchronized(stateLock) {
+                        releaseReaderLocked()
                     }
                 }
             }
         }
 
         /**
-         * Membaca 1 piksel warna untuk Alat Bidik di MainActivity.
-         * Harus dipanggil dari background thread.
+         * Membaca 1 piksel segar untuk Alat Bidik di MainActivity (dipanggil dari background thread).
          */
         fun getPixelHex(x: Int, y: Int): String? {
-            var tempSession = false
-            var seqBefore = 0L
+            var tempReader = false
+            var prevSeq = 0L
 
-            synchronized(captureLock) {
-                if (mediaProjection == null || virtualDisplay == null) return null
-                seqBefore = synchronized(frameSignal) { frameSeq }
+            synchronized(stateLock) {
+                if (mediaProjection == null || virtualDisplay == null || screenWidth <= 0 || screenHeight <= 0) {
+                    return null
+                }
+                prevSeq = synchronized(frameLock) { frameCounter }
                 if (imageReader == null) {
-                    if (ensureReaderAttachedLocked(maxImages = if (pickerSessionHeld) 3 else 2) == null) {
+                    if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) == null) {
                         return null
                     }
-                    activeSessions++
-                    tempSession = true
+                    activeReadersCount++
+                    tempReader = true
                 }
             }
 
             try {
-                val deadlineNanos = System.nanoTime() + (INITIAL_FRAME_WAIT_MS * 1_000_000L)
-                var lastSeq = seqBefore
+                val deadlineNanos = System.nanoTime() + (SINGLE_FRAME_WAIT_MS * 1_000_000L)
+                var img: Image? = acquireFreshImageLocked()
 
-                while (true) {
-                    val hex = readSinglePixelLocked(x, y)
-                    if (hex != null) return hex
-
-                    val remNanos = deadlineNanos - System.nanoTime()
-                    if (remNanos <= 0L) return null
-
-                    val waitMs = ((remNanos + 999_999L) / 1_000_000L).coerceIn(1L, 35L)
-                    synchronized(frameSignal) {
-                        if (frameSeq == lastSeq) {
+                while (img == null && pickerHoldsReader && latestPickerImage != null) {
+                    // Saat picker aktif dan tidak ada frame baru dalam micro-window, pakai frame picker terbaru
+                    val rem = deadlineNanos - System.nanoTime()
+                    if (rem <= (SINGLE_FRAME_WAIT_MS * 500_000L)) {
+                        img = latestPickerImage
+                        break
+                    }
+                    synchronized(frameLock) {
+                        if (frameCounter == prevSeq) {
                             try {
-                                frameSignal.wait(waitMs)
+                                frameLock.wait(20L)
                             } catch (_: InterruptedException) {
                                 Thread.currentThread().interrupt()
-                                return null
+                                break
                             }
                         }
-                        lastSeq = frameSeq
+                        prevSeq = frameCounter
+                    }
+                    img = acquireFreshImageLocked()
+                }
+
+                if (img == null) {
+                    while (img == null) {
+                        val rem = deadlineNanos - System.nanoTime()
+                        if (rem <= 0L) break
+                        synchronized(frameLock) {
+                            if (frameCounter == prevSeq) {
+                                try {
+                                    frameLock.wait(25L)
+                                } catch (_: InterruptedException) {
+                                    Thread.currentThread().interrupt()
+                                    break
+                                }
+                            }
+                            prevSeq = frameCounter
+                        }
+                        img = acquireFreshImageLocked()
+                    }
+                }
+
+                val target = img ?: return null
+                val shouldClose = !(pickerHoldsReader && target === latestPickerImage)
+                return try {
+                    readRgbHexFromImage(target, x, y)
+                } finally {
+                    if (shouldClose) {
+                        try { target.close() } catch (_: Throwable) {}
                     }
                 }
             } finally {
-                if (tempSession) {
-                    synchronized(captureLock) {
-                        releaseSessionLocked()
+                if (tempReader) {
+                    synchronized(stateLock) {
+                        releaseReaderLocked()
                     }
                 }
             }
         }
 
-        /**
-         * Validasi ketat string warna Hex (#RRGGBB atau RRGGBB).
-         * Mengembalikan null jika format salah (tidak jatuh diam-diam ke merah).
-         */
         fun parseHexToIntOrNull(hex: String?): Int? {
             if (hex == null) return null
             val trimmed = hex.trim()
@@ -281,322 +369,104 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        private enum class ScanStep {
-            MATCHED,
-            NOT_MATCHED,
-            NO_IMAGE_YET,
-            ENGINE_STOPPED
-        }
+        /**
+         * Memetakan koordinat dari dimensi referensi saat konfigurasi ke buffer aktual
+         * (menangani perubahan resolusi dan orientasi layar).
+         */
+        fun mapCoordinateToCurrentBuffer(
+            x: Int,
+            y: Int,
+            refW: Int,
+            refH: Int,
+            refRot: Int,
+            bufW: Int,
+            bufH: Int,
+            bufRot: Int
+        ): Pair<Int, Int> {
+            val safeX = x.coerceAtLeast(0)
+            val safeY = y.coerceAtLeast(0)
+            if (bufW <= 0 || bufH <= 0) return Pair(0, 0)
 
-        private fun acquireAndEvaluateOnce(
-            x1: Int, y1: Int, rgb1: Int,
-            useColor2: Boolean, colorLogic: Int,
-            x2: Int, y2: Int, rgb2: Int,
-            radius: Int, step: Int, tolerance: Int,
-            allowPickerCacheFallback: Boolean
-        ): ScanStep {
-            synchronized(captureLock) {
-                val reader = imageReader ?: return ScanStep.ENGINE_STOPPED
-                val freshImg = try {
-                    reader.acquireLatestImage()
-                } catch (_: Throwable) {
-                    null
-                }
+            val srcW = if (refW > 0) refW else bufW
+            val srcH = if (refH > 0) refH else bufH
 
-                if (freshImg != null) {
-                    return try {
-                        val matched = evaluateImageRoi(
-                            freshImg,
-                            x1, y1, rgb1,
-                            useColor2, colorLogic,
-                            x2, y2, rgb2,
-                            radius, step, tolerance
-                        )
-                        if (matched) ScanStep.MATCHED else ScanStep.NOT_MATCHED
-                    } finally {
-                        try { freshImg.close() } catch (_: Throwable) {}
-                    }
-                }
+            val rotDiff = ((bufRot - refRot) % 4 + 4) % 4
+            val mappedX: Int
+            val mappedY: Int
 
-                if (allowPickerCacheFallback) {
-                    val cached = pickerCacheImage
-                    if (cached != null) {
-                        val matched = evaluateImageRoi(
-                            cached,
-                            x1, y1, rgb1,
-                            useColor2, colorLogic,
-                            x2, y2, rgb2,
-                            radius, step, tolerance
-                        )
-                        return if (matched) ScanStep.MATCHED else ScanStep.NOT_MATCHED
-                    }
-                }
-
-                return ScanStep.NO_IMAGE_YET
-            }
-        }
-
-        private fun readSinglePixelLocked(x: Int, y: Int): String? {
-            synchronized(captureLock) {
-                val reader = imageReader ?: return null
-                val freshImg = try {
-                    reader.acquireLatestImage()
-                } catch (_: Throwable) {
-                    null
-                }
-
-                val targetImg: Image?
-                var shouldCloseAfterRead = false
-
-                if (freshImg != null) {
-                    if (pickerSessionHeld) {
-                        closePickerCacheLocked()
-                        pickerCacheImage = freshImg
-                        targetImg = freshImg
-                    } else {
-                        targetImg = freshImg
-                        shouldCloseAfterRead = true
-                    }
-                } else {
-                    targetImg = if (pickerSessionHeld) pickerCacheImage else null
-                }
-
-                if (targetImg == null) return null
-
-                return try {
-                    val planes = targetImg.planes
-                    if (planes.isNullOrEmpty()) return null
-                    val plane = planes[0]
-                    val buf = plane.buffer ?: return null
-                    val w = targetImg.width
-                    val h = targetImg.height
-                    val rs = plane.rowStride
-                    val ps = plane.pixelStride
-                    if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return null
-
-                    val px = x.coerceIn(0, w - 1)
-                    val py = y.coerceIn(0, h - 1)
-                    val off = py * rs + px * ps
-                    val limit = buf.limit()
-                    if (off < 0 || off + 2 >= limit) return null
-
-                    buf.order(ByteOrder.LITTLE_ENDIAN)
-                    val r: Int
-                    val g: Int
-                    val b: Int
-                    if (off + 3 < limit) {
-                        val pixel = buf.getInt(off)
-                        r = pixel and 0xFF
-                        g = (pixel ushr 8) and 0xFF
-                        b = (pixel ushr 16) and 0xFF
-                    } else {
-                        r = buf.get(off).toInt() and 0xFF
-                        g = buf.get(off + 1).toInt() and 0xFF
-                        b = buf.get(off + 2).toInt() and 0xFF
-                    }
-                    val rgb = (r shl 16) or (g shl 8) or b
-                    String.format("#%06X", rgb)
-                } catch (_: Throwable) {
-                    null
-                } finally {
-                    if (shouldCloseAfterRead) {
-                        try { targetImg.close() } catch (_: Throwable) {}
-                    }
-                }
-            }
-        }
-
-        private fun evaluateImageRoi(
-            img: Image,
-            x1: Int, y1: Int, rgb1: Int,
-            useColor2: Boolean, colorLogic: Int,
-            x2: Int, y2: Int, rgb2: Int,
-            radius: Int, step: Int, tolerance: Int
-        ): Boolean {
-            val planes = try { img.planes } catch (_: Throwable) { null } ?: return false
-            if (planes.isEmpty()) return false
-            val plane = planes[0]
-            val buf = plane.buffer ?: return false
-
-            val w = img.width
-            val h = img.height
-            val rs = plane.rowStride
-            val ps = plane.pixelStride
-            if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return false
-
-            buf.order(ByteOrder.LITTLE_ENDIAN)
-
-            if (!useColor2) {
-                return scanAreaCenterOutward(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
-            }
-
-            // Optimasi Single-Pass jika Area 1 dan Area 2 berada di koordinat pusat yang sama
-            if (x1 == x2 && y1 == y2) {
-                return scanAreaDualSameCenter(
-                    buf, w, h, rs, ps,
-                    x1, y1, radius, step,
-                    rgb1, rgb2, colorLogic, tolerance
-                )
-            }
-
-            val m1 = scanAreaCenterOutward(buf, w, h, rs, ps, x1, y1, radius, step, rgb1, tolerance)
-            return if (colorLogic == LOGIC_AND) {
-                if (!m1) false else scanAreaCenterOutward(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+            if (rotDiff == 1) {
+                // Rotasi searah jarum jam 90 derajat
+                mappedX = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufW) / srcH).toInt()
+                mappedY = ((safeX.toLong() * bufH) / srcW).toInt()
+            } else if (rotDiff == 3) {
+                // Rotasi berlawanan arah jarum jam 90 derajat (270 derajat)
+                mappedX = ((safeY.toLong() * bufW) / srcH).toInt()
+                mappedY = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufH) / srcW).toInt()
+            } else if (rotDiff == 2) {
+                // Rotasi 180 derajat
+                mappedX = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufW) / srcW).toInt()
+                mappedY = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufH) / srcH).toInt()
             } else {
-                if (m1) true else scanAreaCenterOutward(buf, w, h, rs, ps, x2, y2, radius, step, rgb2, tolerance)
+                // Orientasi sama; skala proporsional bila resolusi berubah
+                mappedX = ((safeX.toLong() * bufW) / srcW).toInt()
+                mappedY = ((safeY.toLong() * bufH) / srcH).toInt()
             }
+
+            return Pair(
+                mappedX.coerceIn(0, bufW - 1),
+                mappedY.coerceIn(0, bufH - 1)
+            )
         }
 
-        /**
-         * Memindai HANYA kotak area (centerX ± radius, centerY ± radius) dari titik pusat
-         * melebar keluar (expanding square rings) menggunakan Little-Endian native.
-         */
-        private fun scanAreaCenterOutward(
-            buf: ByteBuffer,
-            width: Int,
-            height: Int,
-            rowStride: Int,
-            pixelStride: Int,
-            centerX: Int,
-            centerY: Int,
+        private fun mapRadiusToCurrentBuffer(
             radius: Int,
-            step: Int,
-            targetRgb: Int,
-            tolerance: Int
-        ): Boolean {
-            val r2 = (targetRgb ushr 16) and 0xFF
-            val g2 = (targetRgb ushr 8) and 0xFF
-            val b2 = targetRgb and 0xFF
-
-            val rMin = r2 - tolerance
-            val rMax = r2 + tolerance
-            val gMin = g2 - tolerance
-            val gMax = g2 + tolerance
-            val bMin = b2 - tolerance
-            val bMax = b2 + tolerance
-
-            val cx = centerX.coerceIn(0, width - 1)
-            val cy = centerY.coerceIn(0, height - 1)
-            val limit = buf.limit()
-            val maxX = width - 1
-            val maxY = height - 1
-
-            // 1. Cek titik pusat (1 piksel) terlebih dahulu
-            if (matchPixelAt(buf, limit, cy * rowStride + cx * pixelStride, rMin, rMax, gMin, gMax, bMin, bMax)) {
-                return true
-            }
-
-            // 2. Pindai cincin persegi melebar keluar hingga batas radius
-            var d = step
-            while (d <= radius) {
-                val left = (cx - d).coerceAtLeast(0)
-                val right = (cx + d).coerceAtMost(maxX)
-                val top = cy - d
-                val bottom = cy + d
-
-                // Sisi atas cincin
-                if (top >= 0) {
-                    val rowBase = top * rowStride
-                    var x = left
-                    while (x <= right) {
-                        if (matchPixelAt(buf, limit, rowBase + x * pixelStride, rMin, rMax, gMin, gMax, bMin, bMax)) {
-                            return true
-                        }
-                        x += step
-                    }
-                }
-
-                // Sisi bawah cincin
-                if (bottom <= maxY) {
-                    val rowBase = bottom * rowStride
-                    var x = left
-                    while (x <= right) {
-                        if (matchPixelAt(buf, limit, rowBase + x * pixelStride, rMin, rMax, gMin, gMax, bMin, bMax)) {
-                            return true
-                        }
-                        x += step
-                    }
-                }
-
-                val innerTop = (top + step).coerceAtLeast(0)
-                val innerBottom = (bottom - step).coerceAtMost(maxY)
-
-                // Sisi kiri cincin (tanpa sudut yang sudah dicek)
-                val leftX = cx - d
-                if (leftX >= 0 && innerTop <= innerBottom) {
-                    val colOff = leftX * pixelStride
-                    var y = innerTop
-                    while (y <= innerBottom) {
-                        if (matchPixelAt(buf, limit, y * rowStride + colOff, rMin, rMax, gMin, gMax, bMin, bMax)) {
-                            return true
-                        }
-                        y += step
-                    }
-                }
-
-                // Sisi kanan cincin (tanpa sudut yang sudah dicek)
-                val rightX = cx + d
-                if (rightX <= maxX && innerTop <= innerBottom) {
-                    val colOff = rightX * pixelStride
-                    var y = innerTop
-                    while (y <= innerBottom) {
-                        if (matchPixelAt(buf, limit, y * rowStride + colOff, rMin, rMax, gMin, gMax, bMin, bMax)) {
-                            return true
-                        }
-                        y += step
-                    }
-                }
-
-                d += step
-            }
-
-            return false
+            refW: Int,
+            refH: Int,
+            bufW: Int,
+            bufH: Int
+        ): Int {
+            val srcMin = minOf(if (refW > 0) refW else bufW, if (refH > 0) refH else bufH).coerceAtLeast(1)
+            val dstMin = minOf(bufW, bufH).coerceAtLeast(1)
+            return ((radius.toLong() * dstMin) / srcMin).toInt().coerceIn(1, 600)
         }
 
-        /**
-         * Pemindaian Single-Pass untuk 2 warna pada pusat area yang sama.
-         */
-        private fun scanAreaDualSameCenter(
-            buf: ByteBuffer,
-            width: Int,
-            height: Int,
-            rowStride: Int,
-            pixelStride: Int,
-            centerX: Int,
-            centerY: Int,
-            radius: Int,
-            step: Int,
-            rgb1: Int,
-            rgb2: Int,
-            colorLogic: Int,
-            tolerance: Int
-        ): Boolean {
-            val r1 = (rgb1 ushr 16) and 0xFF
-            val g1 = (rgb1 ushr 8) and 0xFF
-            val b1 = rgb1 and 0xFF
-            val r1Min = r1 - tolerance; val r1Max = r1 + tolerance
-            val g1Min = g1 - tolerance; val g1Max = g1 + tolerance
-            val b1Min = b1 - tolerance; val b1Max = b1 + tolerance
+        private fun acquireFreshImageLocked(): Image? {
+            val reader = synchronized(stateLock) { imageReader } ?: return null
+            val fresh = try {
+                reader.acquireLatestImage()
+            } catch (_: Throwable) {
+                null
+            }
+            if (fresh != null) {
+                synchronized(stateLock) {
+                    if (pickerHoldsReader) {
+                        closePickerImageLocked()
+                        latestPickerImage = fresh
+                    }
+                }
+            }
+            return fresh
+        }
 
-            val r2 = (rgb2 ushr 16) and 0xFF
-            val g2 = (rgb2 ushr 8) and 0xFF
-            val b2 = rgb2 and 0xFF
-            val r2Min = r2 - tolerance; val r2Max = r2 + tolerance
-            val g2Min = g2 - tolerance; val g2Max = g2 + tolerance
-            val b2Min = b2 - tolerance; val b2Max = b2 + tolerance
+        private fun readRgbHexFromImage(img: Image, x: Int, y: Int): String? {
+            return try {
+                val planes = img.planes
+                if (planes.isNullOrEmpty()) return null
+                val plane = planes[0]
+                val buf = plane.buffer ?: return null
+                val w = img.width
+                val h = img.height
+                val rs = plane.rowStride
+                val ps = plane.pixelStride
+                if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) return null
 
-            val isOr = (colorLogic == LOGIC_OR)
-            val cx = centerX.coerceIn(0, width - 1)
-            val cy = centerY.coerceIn(0, height - 1)
-            val limit = buf.limit()
-            val maxX = width - 1
-            val maxY = height - 1
+                val px = x.coerceIn(0, w - 1)
+                val py = y.coerceIn(0, h - 1)
+                val off = py * rs + px * ps
+                val limit = buf.limit()
+                if (off < 0 || off + 2 >= limit) return null
 
-            var found1 = false
-            var found2 = false
-
-            fun checkOffset(off: Int): Boolean {
-                if (off < 0 || off + 2 >= limit) return false
+                buf.order(ByteOrder.LITTLE_ENDIAN)
                 val r: Int
                 val g: Int
                 val b: Int
@@ -610,95 +480,163 @@ class ScreenCaptureService : Service() {
                     g = buf.get(off + 1).toInt() and 0xFF
                     b = buf.get(off + 2).toInt() and 0xFF
                 }
-                if (!found1 && r in r1Min..r1Max && g in g1Min..g1Max && b in b1Min..b1Max) {
-                    found1 = true
-                    if (isOr || found2) return true
-                }
-                if (!found2 && r in r2Min..r2Max && g in g2Min..g2Max && b in b2Min..b2Max) {
-                    found2 = true
-                    if (isOr || found1) return true
-                }
-                return false
+                val rgb = (r shl 16) or (g shl 8) or b
+                String.format("#%06X", rgb)
+            } catch (_: Throwable) {
+                null
             }
-
-            if (checkOffset(cy * rowStride + cx * pixelStride)) return true
-
-            var d = step
-            while (d <= radius) {
-                val left = (cx - d).coerceAtLeast(0)
-                val right = (cx + d).coerceAtMost(maxX)
-                val top = cy - d
-                val bottom = cy + d
-
-                if (top >= 0) {
-                    val rowBase = top * rowStride
-                    var x = left
-                    while (x <= right) {
-                        if (checkOffset(rowBase + x * pixelStride)) return true
-                        x += step
-                    }
-                }
-                if (bottom <= maxY) {
-                    val rowBase = bottom * rowStride
-                    var x = left
-                    while (x <= right) {
-                        if (checkOffset(rowBase + x * pixelStride)) return true
-                        x += step
-                    }
-                }
-
-                val innerTop = (top + step).coerceAtLeast(0)
-                val innerBottom = (bottom - step).coerceAtMost(maxY)
-
-                val leftX = cx - d
-                if (leftX >= 0 && innerTop <= innerBottom) {
-                    val colOff = leftX * pixelStride
-                    var y = innerTop
-                    while (y <= innerBottom) {
-                        if (checkOffset(y * rowStride + colOff)) return true
-                        y += step
-                    }
-                }
-                val rightX = cx + d
-                if (rightX <= maxX && innerTop <= innerBottom) {
-                    val colOff = rightX * pixelStride
-                    var y = innerTop
-                    while (y <= innerBottom) {
-                        if (checkOffset(y * rowStride + colOff)) return true
-                        y += step
-                    }
-                }
-                d += step
-            }
-            return false
         }
 
-        private fun matchPixelAt(
+        /**
+         * Pemindaian ROI berurutan per baris (row-major) agar ramah CPU cache,
+         * tanpa alokasi objek di dalam loop, dan mematuhi mode 1 / 2 / 3.
+         */
+        private fun evaluateRoiOnce(
+            image: Image,
+            useColor1: Boolean,
+            useColor2: Boolean,
+            colorLogic: Int,
+            cx1: Int, cy1: Int, rgb1: Int,
+            cx2: Int, cy2: Int, rgb2: Int,
+            radius: Int,
+            step: Int,
+            tolerance: Int,
+            minMatches: Int
+        ): EvalOutcome {
+            val planes = try { image.planes } catch (_: Throwable) { null } ?: return EvalOutcome(
+                EvalStatus.ERR_CAPTURE_FAILED, 0, "NO_PLANES"
+            )
+            if (planes.isEmpty()) return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "EMPTY_PLANES")
+            val plane = planes[0]
+            val buf = plane.buffer ?: return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "NULL_BUFFER")
+
+            val w = image.width
+            val h = image.height
+            val rs = plane.rowStride
+            val ps = plane.pixelStride
+            if (w <= 0 || h <= 0 || rs <= 0 || ps <= 0) {
+                return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "INVALID_STRIDE")
+            }
+
+            buf.order(ByteOrder.LITTLE_ENDIAN)
+            val limit = buf.limit()
+
+            val count1 = if (useColor1) {
+                countMatchesInBoxRowMajor(buf, limit, w, h, rs, ps, cx1, cy1, radius, step, rgb1, tolerance, minMatches)
+            } else {
+                0
+            }
+
+            val count2 = if (useColor2) {
+                countMatchesInBoxRowMajor(buf, limit, w, h, rs, ps, cx2, cy2, radius, step, rgb2, tolerance, minMatches)
+            } else {
+                0
+            }
+
+            val matched = when {
+                useColor1 && useColor2 -> {
+                    if (colorLogic == LOGIC_OR) {
+                        count1 >= minMatches || count2 >= minMatches
+                    } else {
+                        count1 >= minMatches && count2 >= minMatches
+                    }
+                }
+                useColor1 -> count1 >= minMatches
+                useColor2 -> count2 >= minMatches
+                else -> false
+            }
+
+            val totalMatched = when {
+                useColor1 && useColor2 -> if (colorLogic == LOGIC_OR) maxOf(count1, count2) else minOf(count1, count2)
+                useColor1 -> count1
+                else -> count2
+            }
+
+            return if (matched) {
+                EvalOutcome(EvalStatus.MATCHED, totalMatched, "MATCHED")
+            } else {
+                EvalOutcome(EvalStatus.NOT_MATCHED, totalMatched, "NOT_MATCHED")
+            }
+        }
+
+        private fun countMatchesInBoxRowMajor(
             buf: ByteBuffer,
             limit: Int,
-            off: Int,
-            rMin: Int, rMax: Int,
-            gMin: Int, gMax: Int,
-            bMin: Int, bMax: Int
-        ): Boolean {
-            if (off < 0 || off + 2 >= limit) return false
-            val r: Int
-            val g: Int
-            val b: Int
-            if (off + 3 < limit) {
-                val pixel = buf.getInt(off)
-                r = pixel and 0xFF
-                g = (pixel ushr 8) and 0xFF
-                b = (pixel ushr 16) and 0xFF
-            } else {
-                r = buf.get(off).toInt() and 0xFF
-                g = buf.get(off + 1).toInt() and 0xFF
-                b = buf.get(off + 2).toInt() and 0xFF
+            width: Int,
+            height: Int,
+            rowStride: Int,
+            pixelStride: Int,
+            centerX: Int,
+            centerY: Int,
+            radius: Int,
+            step: Int,
+            targetRgb: Int,
+            tolerance: Int,
+            minMatches: Int
+        ): Int {
+            val tr = (targetRgb ushr 16) and 0xFF
+            val tg = (targetRgb ushr 8) and 0xFF
+            val tb = targetRgb and 0xFF
+
+            val rMin = tr - tolerance
+            val rMax = tr + tolerance
+            val gMin = tg - tolerance
+            val gMax = tg + tolerance
+            val bMin = tb - tolerance
+            val bMax = tb + tolerance
+
+            val left = (centerX - radius).coerceIn(0, width - 1)
+            val right = (centerX + radius).coerceIn(0, width - 1)
+            val top = (centerY - radius).coerceIn(0, height - 1)
+            val bottom = (centerY + radius).coerceIn(0, height - 1)
+
+            // Batas jarak kuadrat gabungan (ringan dan mengurangi error akibat shading/gamma)
+            val maxChannelDistSq = tolerance * tolerance * 3
+
+            var matches = 0
+            var y = top
+            while (y <= bottom) {
+                val rowBase = y * rowStride
+                var x = left
+                while (x <= right) {
+                    val off = rowBase + x * pixelStride
+                    if (off >= 0 && off + 2 < limit) {
+                        val r: Int
+                        val g: Int
+                        val b: Int
+                        if (off + 3 < limit) {
+                            val pixel = buf.getInt(off)
+                            r = pixel and 0xFF
+                            g = (pixel ushr 8) and 0xFF
+                            b = (pixel ushr 16) and 0xFF
+                        } else {
+                            r = buf.get(off).toInt() and 0xFF
+                            g = buf.get(off + 1).toInt() and 0xFF
+                            b = buf.get(off + 2).toInt() and 0xFF
+                        }
+
+                        if (r in rMin..rMax && g in gMin..gMax && b in bMin..bMax) {
+                            val dr = r - tr
+                            val dg = g - tg
+                            val db = b - tb
+                            if ((dr * dr + dg * dg + db * db) <= maxChannelDistSq) {
+                                matches++
+                                if (matches >= minMatches) {
+                                    return matches
+                                }
+                            }
+                        }
+                    }
+                    x += step
+                }
+                if (y == bottom) break
+                val nextY = y + step
+                y = if (nextY > bottom) bottom else nextY
             }
-            return r in rMin..rMax && g in gMin..gMax && b in bMin..bMax
+            return matches
         }
 
-        private fun ensureReaderAttachedLocked(maxImages: Int): ImageReader? {
+        private fun attachReaderLocked(maxImages: Int): ImageReader? {
             val vd = virtualDisplay ?: return null
             if (mediaProjection == null) return null
             val w = screenWidth
@@ -708,33 +646,39 @@ class ScreenCaptureService : Service() {
             var reader = imageReader
             if (reader == null) {
                 reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, maxImages)
-                reader.setOnImageAvailableListener(onDemandFrameListener, bgHandler)
+                reader.setOnImageAvailableListener(frameAvailableListener, frameHandler)
                 imageReader = reader
-                vd.setSurface(reader.surface)
+                try {
+                    vd.setSurface(reader.surface)
+                } catch (_: Throwable) {
+                    imageReader = null
+                    try { reader.close() } catch (_: Throwable) {}
+                    return null
+                }
             }
             return reader
         }
 
-        private fun releaseSessionLocked() {
-            if (activeSessions > 0) {
-                activeSessions--
+        private fun releaseReaderLocked() {
+            if (activeReadersCount > 0) {
+                activeReadersCount--
             }
-            if (activeSessions <= 0) {
-                activeSessions = 0
+            if (activeReadersCount <= 0 && !pickerHoldsReader) {
+                activeReadersCount = 0
                 detachAndCloseReaderLocked()
             }
         }
 
-        private fun closePickerCacheLocked() {
-            val cached = pickerCacheImage
-            pickerCacheImage = null
-            if (cached != null) {
-                try { cached.close() } catch (_: Throwable) {}
+        private fun closePickerImageLocked() {
+            val img = latestPickerImage
+            latestPickerImage = null
+            if (img != null) {
+                try { img.close() } catch (_: Throwable) {}
             }
         }
 
         private fun detachAndCloseReaderLocked() {
-            closePickerCacheLocked()
+            closePickerImageLocked()
             try { virtualDisplay?.setSurface(null) } catch (_: Throwable) {}
             val reader = imageReader
             imageReader = null
@@ -751,14 +695,13 @@ class ScreenCaptureService : Service() {
         override fun onDisplayRemoved(displayId: Int) {}
         override fun onDisplayChanged(displayId: Int) {
             if (displayId == Display.DEFAULT_DISPLAY) {
-                syncDisplayMetricsFromSystem()
+                syncDisplayMetrics()
             }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         displayManager?.registerDisplayListener(displayListener, mainHandler)
     }
@@ -780,8 +723,8 @@ class ScreenCaptureService : Service() {
 
         if (resultCode == Activity.RESULT_OK && data != null) {
             try {
-                startForegroundServiceNotification()
-                val ok = setupProjection(resultCode, data)
+                startForegroundNotification()
+                val ok = startProjection(resultCode, data)
                 if (!ok) {
                     shutdownServiceCompletely()
                 }
@@ -792,71 +735,85 @@ class ScreenCaptureService : Service() {
             stopSelf()
         }
 
-        // START_NOT_STICKY wajib untuk MediaProjection agar tidak crash saat proses dihidupkan ulang sistem
         return START_NOT_STICKY
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        syncDisplayMetricsFromSystem()
+        syncDisplayMetrics()
     }
 
-    private fun getExactPhysicalSize(): Triple<Int, Int, Int> {
+    private fun readDisplayMetrics(): Pair<Pair<Int, Int>, Pair<Int, Int>> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val densityDpi = resources.configuration.densityDpi.coerceAtLeast(120)
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        @Suppress("DEPRECATION")
+        val rotation = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display?.rotation ?: wm.defaultDisplay.rotation
+            } else {
+                wm.defaultDisplay.rotation
+            }
+        } catch (_: Throwable) {
+            Surface.ROTATION_0
+        }
+
+        val size = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = wm.maximumWindowMetrics.bounds
-            Triple(bounds.width().coerceAtLeast(1), bounds.height().coerceAtLeast(1), densityDpi)
+            Pair(bounds.width().coerceAtLeast(1), bounds.height().coerceAtLeast(1))
         } else {
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
             wm.defaultDisplay.getRealMetrics(metrics)
-            Triple(
-                metrics.widthPixels.coerceAtLeast(1),
-                metrics.heightPixels.coerceAtLeast(1),
-                metrics.densityDpi.coerceAtLeast(120)
-            )
+            Pair(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1))
         }
+
+        return Pair(size, Pair(densityDpi, rotation))
     }
 
-    private fun syncDisplayMetricsFromSystem() {
-        synchronized(captureLock) {
-            if (hasCapturedContentResize) return
-            if (virtualDisplay == null) return
-        }
-        val (w, h, dpi) = getExactPhysicalSize()
-        applyResize(w, h, dpi)
+    private fun syncDisplayMetrics() {
+        val (size, meta) = readDisplayMetrics()
+        val (w, h) = size
+        val (dpi, rot) = meta
+        applyResize(w, h, dpi, rot)
     }
 
-    private fun applyResize(newW: Int, newH: Int, newDpi: Int) {
+    private fun applyResize(newW: Int, newH: Int, newDpi: Int, newRot: Int) {
         if (newW <= 0 || newH <= 0) return
-        synchronized(captureLock) {
+        synchronized(stateLock) {
             val vd = virtualDisplay ?: return
-            if (newW == screenWidth && newH == screenHeight && newDpi == screenDensity) return
-
+            if (newW == screenWidth && newH == screenHeight && newDpi == screenDensity && newRot == screenRotation) {
+                return
+            }
             screenWidth = newW
             screenHeight = newH
             screenDensity = newDpi
+            screenRotation = newRot
 
-            val wasAttached = (imageReader != null)
-            if (wasAttached) {
+            val hadReader = (imageReader != null)
+            val prevCount = activeReadersCount
+            if (hadReader) {
                 detachAndCloseReaderLocked()
             }
             try {
                 vd.resize(newW, newH, newDpi)
             } catch (_: Throwable) {}
 
-            if (wasAttached && activeSessions > 0) {
-                ensureReaderAttachedLocked(maxImages = if (pickerSessionHeld) 3 else 2)
+            if (hadReader && (pickerHoldsReader || prevCount > 0)) {
+                if (attachReaderLocked(maxImages = if (pickerHoldsReader) 3 else 2) != null) {
+                    activeReadersCount = maxOf(prevCount, if (pickerHoldsReader) 1 else 0)
+                }
             }
         }
     }
 
-    private fun setupProjection(resultCode: Int, data: Intent): Boolean {
+    private fun startProjection(resultCode: Int, data: Intent): Boolean {
         stopProjection()
 
-        val (w, h, dpi) = getExactPhysicalSize()
-        val thread = HandlerThread("FastColorFrameThread", Process.THREAD_PRIORITY_BACKGROUND)
+        val (size, meta) = readDisplayMetrics()
+        val (w, h) = size
+        val (dpi, rot) = meta
+
+        val thread = HandlerThread("FastColorFrameThread", Process.THREAD_PRIORITY_DISPLAY)
         thread.start()
         val handler = Handler(thread.looper)
 
@@ -872,15 +829,25 @@ class ScreenCaptureService : Service() {
             }
 
             override fun onCapturedContentResize(width: Int, height: Int) {
-                synchronized(captureLock) {
-                    hasCapturedContentResize = true
-                }
                 val currentDpi = resources.configuration.densityDpi.coerceAtLeast(120)
-                applyResize(width, height, currentDpi)
+                val currentRot = screenRotation
+                applyResize(width, height, currentDpi, currentRot)
             }
-        }, mainHandler)
+        }, handler)
 
-        // Buat VirtualDisplay dalam kondisi PAUSED (surface = null) agar langsung Strict True-Idle (0% GPU/CPU, 0 MB Buffer)
+        // Android 14+ (API 34): paksa tangkapan layar penuh default display agar koordinat konsisten
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                projection.launchCookie
+                val config = MediaProjectionConfig.createConfigForDefaultDisplay()
+                // Catatan: createScreenCaptureIntent menerima config saat meminta izin;
+                // di sisi service kita tetap membuat VirtualDisplay dengan surface=null untuk True-Idle.
+                @Suppress("UNUSED_VARIABLE")
+                val unusedConfig = config
+            } catch (_: Throwable) {}
+        }
+
+        // VirtualDisplay dibuat dengan surface = null -> kondisi awal True-Idle (0 frame aktif)
         val vd = projection.createVirtualDisplay(
             "FastAutoColorEngine",
             w, h, dpi,
@@ -894,21 +861,20 @@ class ScreenCaptureService : Service() {
             return false
         }
 
-        synchronized(captureLock) {
+        synchronized(stateLock) {
             screenWidth = w
             screenHeight = h
             screenDensity = dpi
-            hasCapturedContentResize = false
-            bgThread = thread
-            bgHandler = handler
+            screenRotation = rot
+            frameThread = thread
+            frameHandler = handler
             mediaProjection = projection
             virtualDisplay = vd
 
-            // Jika pengguna membuka Alat Bidik sebelum menyalakan Mesin RAM, langsung aktifkan sesi picker
-            if (pickerRequested && !pickerSessionHeld) {
-                if (ensureReaderAttachedLocked(maxImages = 3) != null) {
-                    activeSessions++
-                    pickerSessionHeld = true
+            if (pickerActiveFlag && !pickerHoldsReader) {
+                if (attachReaderLocked(maxImages = 3) != null) {
+                    activeReadersCount++
+                    pickerHoldsReader = true
                 }
             }
         }
@@ -933,23 +899,22 @@ class ScreenCaptureService : Service() {
         val vdToRelease: VirtualDisplay?
         val mpToStop: MediaProjection?
 
-        synchronized(captureLock) {
-            activeSessions = 0
-            pickerSessionHeld = false
-            hasCapturedContentResize = false
+        synchronized(stateLock) {
+            activeReadersCount = 0
+            pickerHoldsReader = false
             detachAndCloseReaderLocked()
 
             vdToRelease = virtualDisplay
             virtualDisplay = null
             mpToStop = mediaProjection
             mediaProjection = null
-            threadToQuit = bgThread
-            bgThread = null
-            bgHandler = null
+            threadToQuit = frameThread
+            frameThread = null
+            frameHandler = null
         }
 
-        synchronized(frameSignal) {
-            frameSignal.notifyAll()
+        synchronized(frameLock) {
+            frameLock.notifyAll()
         }
 
         try { vdToRelease?.release() } catch (_: Throwable) {}
@@ -957,7 +922,7 @@ class ScreenCaptureService : Service() {
         try { threadToQuit?.quitSafely() } catch (_: Throwable) {}
     }
 
-    private fun startForegroundServiceNotification() {
+    private fun startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
@@ -968,7 +933,7 @@ class ScreenCaptureService : Service() {
         }
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("FastAuto Area Engine")
-            .setContentText("On-Demand Area Color Scanner (True-Idle)")
+            .setContentText("One-Shot Area Color Scanner (True-Idle)")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
@@ -988,7 +953,6 @@ class ScreenCaptureService : Service() {
     override fun onDestroy() {
         try { displayManager?.unregisterDisplayListener(displayListener) } catch (_: Throwable) {}
         stopProjection()
-        if (instance == this) instance = null
         super.onDestroy()
     }
 
