@@ -13,6 +13,9 @@ class PluginFireReceiver : BroadcastReceiver() {
         const val ACTION_QUERY_CONDITION = "com.twofortyfouram.locale.intent.action.QUERY_CONDITION"
         const val EXTRA_BUNDLE = "com.twofortyfouram.locale.intent.extra.BUNDLE"
 
+        const val EXTRA_VARIABLE_BUNDLE = "net.dinglisch.android.tasker.extras.VARIABLES"
+        const val EXTRA_RELEVANT_VARIABLES = "net.dinglisch.android.tasker.RELEVANT_VARIABLES"
+
         const val RESULT_CONDITION_SATISFIED = 16
         const val RESULT_CONDITION_UNSATISFIED = 17
         const val RESULT_CONDITION_UNKNOWN = 18
@@ -59,6 +62,14 @@ class PluginFireReceiver : BroadcastReceiver() {
         }
 
         val pickOneTarget = bundle.getInt("pickOneTarget", ScreenCaptureService.PICK_ONE_COLOR_1)
+        if (colorMode == ScreenCaptureService.COLOR_MODE_PICK_ONE &&
+            pickOneTarget != ScreenCaptureService.PICK_ONE_COLOR_1 &&
+            pickOneTarget != ScreenCaptureService.PICK_ONE_COLOR_2
+        ) {
+            finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_PICK_ONE_TARGET", 0)
+            return
+        }
+
         val useColor1 = when (colorMode) {
             ScreenCaptureService.COLOR_MODE_SINGLE -> true
             ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS -> true
@@ -198,10 +209,16 @@ class PluginFireReceiver : BroadcastReceiver() {
         detail: String,
         matchCount: Int
     ) {
+        val taskerVars = Bundle().apply {
+            putString("%fastauto_status", status)
+            putString("%fastauto_detail", detail)
+            putString("%fastauto_match_count", matchCount.toString())
+        }
         val extras = Bundle().apply {
             putString(EXTRA_OUT_STATUS, status)
             putString(EXTRA_OUT_DETAIL, detail)
             putInt(EXTRA_OUT_MATCH_COUNT, matchCount)
+            putBundle(EXTRA_VARIABLE_BUNDLE, taskerVars)
         }
         try {
             if (isOrdered) {
