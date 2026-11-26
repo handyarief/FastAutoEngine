@@ -3,10 +3,9 @@ package com.fastauto.engine
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import java.util.concurrent.LinkedBlockingQueue
+import android.os.Bundle
+import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 
 class PluginFireReceiver : BroadcastReceiver() {
 
@@ -18,18 +17,16 @@ class PluginFireReceiver : BroadcastReceiver() {
         const val RESULT_CONDITION_UNSATISFIED = 17
         const val RESULT_CONDITION_UNKNOWN = 18
 
-        private const val MAX_SAFE_TIMEOUT_MS = 5000L
-        private const val MAX_BROADCAST_BUDGET_MS = 6500L
+        const val EXTRA_OUT_STATUS = "com.fastauto.engine.extra.STATUS"
+        const val EXTRA_OUT_DETAIL = "com.fastauto.engine.extra.DETAIL"
+        const val EXTRA_OUT_MATCH_COUNT = "com.fastauto.engine.extra.MATCH_COUNT"
 
-        // Thread pool ringan yang otomatis mematikan thread setelah 15 detik idle (0% CPU saat idle)
-        private val workerExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
-            2,
-            2,
-            15L,
-            TimeUnit.SECONDS,
-            LinkedBlockingQueue(16)
-        ).apply {
-            allowCoreThreadTimeOut(true)
+        // 1 worker tetap (parked saat idle -> ~0% CPU, tanpa overhead buat thread baru saat dipanggil)
+        private val oneShotExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "FastOneShotWorker").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY + 1
+            }
         }
     }
 
@@ -37,7 +34,6 @@ class PluginFireReceiver : BroadcastReceiver() {
         if (intent.action != ACTION_QUERY_CONDITION) return
 
         val isOrdered = isOrderedBroadcast
-
         val bundle = try {
             intent.getBundleExtra(EXTRA_BUNDLE)
         } catch (_: Throwable) {
@@ -45,116 +41,200 @@ class PluginFireReceiver : BroadcastReceiver() {
         }
 
         if (bundle == null) {
-            if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
+            finishWithResult(
+                isOrdered = isOrdered,
+                pendingResult = null,
+                code = RESULT_CONDITION_UNKNOWN,
+                status = "UNKNOWN",
+                detail = "MISSING_BUNDLE",
+                matchCount = 0
+            )
             return
         }
 
-        // Cepat kembali tanpa membuat worker jika Mesin RAM belum dinyalakan
         if (!ScreenCaptureService.isReady()) {
-            if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
+            finishWithResult(
+                isOrdered = isOrdered,
+                pendingResult = null,
+                code = RESULT_CONDITION_UNKNOWN,
+                status = "UNKNOWN",
+                detail = "ENGINE_NOT_READY",
+                matchCount = 0
+            )
             return
         }
 
-        val x1 = bundle.getInt("x", -1)
-        val y1 = bundle.getInt("y", -1)
-        if (x1 < 0 || y1 < 0) {
-            if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
+        val colorMode = bundle.getInt("colorMode", ScreenCaptureService.COLOR_MODE_SINGLE)
+        if (colorMode != ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS &&
+            colorMode != ScreenCaptureService.COLOR_MODE_SINGLE &&
+            colorMode != ScreenCaptureService.COLOR_MODE_PICK_ONE
+        ) {
+            finishWithResult(
+                isOrdered = isOrdered,
+                pendingResult = null,
+                code = RESULT_CONDITION_UNKNOWN,
+                status = "UNKNOWN",
+                detail = "INVALID_COLOR_MODE",
+                matchCount = 0
+            )
             return
         }
 
-        val targetRgb1 = if (bundle.containsKey("rgb1")) {
-            bundle.getInt("rgb1") and 0xFFFFFF
-        } else {
-            ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex"))
-                ?: run {
-                    if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
+        val pickOneTarget = bundle.getInt("pickOneTarget", ScreenCaptureService.PICK_ONE_COLOR_1)
+        val useColor1 = when (colorMode) {
+            ScreenCaptureService.COLOR_MODE_SINGLE -> true
+            ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS -> true
+            ScreenCaptureService.COLOR_MODE_PICK_ONE -> pickOneTarget == ScreenCaptureService.PICK_ONE_COLOR_1
+            else -> false
+        }
+        val useColor2 = when (colorMode) {
+            ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS -> true
+            ScreenCaptureService.COLOR_MODE_PICK_ONE -> pickOneTarget == ScreenCaptureService.PICK_ONE_COLOR_2
+            else -> false
+        }
+
+        var x1 = 0
+        var y1 = 0
+        var rgb1 = 0
+        if (useColor1) {
+            x1 = bundle.getInt("x", -1)
+            y1 = bundle.getInt("y", -1)
+            if (x1 < 0 || y1 < 0) {
+                finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_COORD_1", 0)
+                return
+            }
+            rgb1 = if (bundle.containsKey("rgb1")) {
+                bundle.getInt("rgb1") and 0xFFFFFF
+            } else {
+                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex")) ?: run {
+                    finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_1", 0)
                     return
                 }
-        }
-
-        val useColor2 = bundle.getBoolean("useColor2", false)
-        val colorLogic = bundle.getInt("colorLogic", ScreenCaptureService.LOGIC_AND)
-        if (useColor2 && colorLogic != ScreenCaptureService.LOGIC_AND && colorLogic != ScreenCaptureService.LOGIC_OR) {
-            if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
-            return
+            }
         }
 
         var x2 = 0
         var y2 = 0
-        var targetRgb2 = 0
+        var rgb2 = 0
         if (useColor2) {
             x2 = bundle.getInt("x2", -1)
             y2 = bundle.getInt("y2", -1)
             if (x2 < 0 || y2 < 0) {
-                if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
+                finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_COORD_2", 0)
                 return
             }
-            targetRgb2 = if (bundle.containsKey("rgb2")) {
+            rgb2 = if (bundle.containsKey("rgb2")) {
                 bundle.getInt("rgb2") and 0xFFFFFF
             } else {
-                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex2"))
-                    ?: run {
-                        if (isOrdered) resultCode = RESULT_CONDITION_UNKNOWN
-                        return
-                    }
+                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex2")) ?: run {
+                    finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_2", 0)
+                    return
+                }
             }
         }
 
-        val radius = bundle.getInt("radius", 100).coerceIn(1, 500)
-        val step = bundle.getInt("step", 4).coerceIn(1, 20)
-        val tolerance = bundle.getInt("tolerance", 20).coerceIn(0, 255)
-        val requestedTimeout = bundle.getLong("timeout", 0L).coerceIn(0L, MAX_SAFE_TIMEOUT_MS)
+        val colorLogic = bundle.getInt("colorLogic", ScreenCaptureService.LOGIC_AND)
+        val refWidth = bundle.getInt("refWidth", 0)
+        val refHeight = bundle.getInt("refHeight", 0)
+        val refRotation = bundle.getInt("refRotation", 0)
 
-        val receiveStartNanos = System.nanoTime()
+        val radius = bundle.getInt("radius", 40).coerceIn(1, 600)
+        val step = bundle.getInt("step", 2).coerceIn(1, 24)
+        val tolerance = bundle.getInt("tolerance", 20).coerceIn(0, 255)
+        val minMatches = bundle.getInt("minMatches", 1).coerceIn(1, 500)
+
         val pendingResult = goAsync()
 
         try {
-            workerExecutor.execute {
-                var finalCode = RESULT_CONDITION_UNKNOWN
+            oneShotExecutor.execute {
+                var code = RESULT_CONDITION_UNKNOWN
+                var status = "UNKNOWN"
+                var detail = "UNEXPECTED_ERROR"
+                var matchCount = 0
+
                 try {
-                    val elapsedMs = (System.nanoTime() - receiveStartNanos) / 1_000_000L
-                    val remainingBudgetMs = MAX_BROADCAST_BUDGET_MS - elapsedMs
+                    val outcome = ScreenCaptureService.evaluateOneShot(
+                        colorMode = colorMode,
+                        pickOneTarget = pickOneTarget,
+                        colorLogic = colorLogic,
+                        x1 = x1, y1 = y1, rgb1 = rgb1,
+                        x2 = x2, y2 = y2, rgb2 = rgb2,
+                        refWidth = refWidth, refHeight = refHeight, refRotation = refRotation,
+                        radius = radius, step = step, tolerance = tolerance, minMatches = minMatches
+                    )
+                    matchCount = outcome.matchedCount
+                    detail = outcome.detail
 
-                    if (remainingBudgetMs > 100L) {
-                        val effectiveTimeout = if (requestedTimeout > 0L) {
-                            minOf(requestedTimeout, remainingBudgetMs - 100L)
-                        } else {
-                            0L
+                    when (outcome.status) {
+                        ScreenCaptureService.EvalStatus.MATCHED -> {
+                            code = RESULT_CONDITION_SATISFIED
+                            status = "SATISFIED"
                         }
-
-                        val eval = ScreenCaptureService.evaluateAreaOnDemand(
-                            x1, y1, targetRgb1,
-                            useColor2, colorLogic,
-                            x2, y2, targetRgb2,
-                            radius, step, tolerance,
-                            effectiveTimeout
-                        )
-
-                        finalCode = when (eval) {
-                            ScreenCaptureService.EvalResult.MATCHED -> RESULT_CONDITION_SATISFIED
-                            ScreenCaptureService.EvalResult.NOT_MATCHED -> RESULT_CONDITION_UNSATISFIED
-                            ScreenCaptureService.EvalResult.ENGINE_NOT_READY,
-                            ScreenCaptureService.EvalResult.CAPTURE_FAILED -> RESULT_CONDITION_UNKNOWN
+                        ScreenCaptureService.EvalStatus.NOT_MATCHED -> {
+                            code = RESULT_CONDITION_UNSATISFIED
+                            status = "UNSATISFIED"
+                        }
+                        ScreenCaptureService.EvalStatus.ERR_ENGINE_NOT_READY,
+                        ScreenCaptureService.EvalStatus.ERR_CAPTURE_FAILED,
+                        ScreenCaptureService.EvalStatus.ERR_INVALID_CONFIG -> {
+                            code = RESULT_CONDITION_UNKNOWN
+                            status = "UNKNOWN"
                         }
                     }
                 } catch (_: Throwable) {
-                    finalCode = RESULT_CONDITION_UNKNOWN
+                    code = RESULT_CONDITION_UNKNOWN
+                    status = "UNKNOWN"
+                    detail = "EXCEPTION"
                 } finally {
-                    try {
-                        if (isOrdered) {
-                            pendingResult.resultCode = finalCode
-                        }
-                        pendingResult.finish()
-                    } catch (_: Throwable) {}
+                    finishWithResult(
+                        isOrdered = isOrdered,
+                        pendingResult = pendingResult,
+                        code = code,
+                        status = status,
+                        detail = detail,
+                        matchCount = matchCount
+                    )
                 }
             }
         } catch (_: RejectedExecutionException) {
-            try {
-                if (isOrdered) {
-                    pendingResult.resultCode = RESULT_CONDITION_UNKNOWN
-                }
-                pendingResult.finish()
-            } catch (_: Throwable) {}
+            finishWithResult(
+                isOrdered = isOrdered,
+                pendingResult = pendingResult,
+                code = RESULT_CONDITION_UNKNOWN,
+                status = "UNKNOWN",
+                detail = "EXECUTOR_BUSY",
+                matchCount = 0
+            )
         }
+    }
+
+    private fun finishWithResult(
+        isOrdered: Boolean,
+        pendingResult: PendingResult?,
+        code: Int,
+        status: String,
+        detail: String,
+        matchCount: Int
+    ) {
+        val extras = Bundle().apply {
+            putString(EXTRA_OUT_STATUS, status)
+            putString(EXTRA_OUT_DETAIL, detail)
+            putInt(EXTRA_OUT_MATCH_COUNT, matchCount)
+        }
+        try {
+            if (isOrdered) {
+                if (pendingResult != null) {
+                    pendingResult.resultCode = code
+                    pendingResult.resultExtras = extras
+                } else {
+                    resultCode = code
+                    setResultExtras(extras)
+                }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            pendingResult?.finish()
+        } catch (_: Throwable) {}
     }
 }
