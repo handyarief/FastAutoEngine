@@ -4,10 +4,12 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
@@ -71,7 +73,7 @@ class PluginConfigActivity : AppCompatActivity() {
         }
 
         layout.addView(TextView(this).apply {
-            text = "⚡ Konfigurasi Pemindai Area (One-Shot)"
+            text = "⚡ Konfigurasi Pemindai Area (One-Shot Opsi A)"
             textSize = 20f
             setTextColor(Color.parseColor("#00E676"))
             setPadding(0, 0, 0, dp(4))
@@ -162,21 +164,13 @@ class PluginConfigActivity : AppCompatActivity() {
         }
         color1Container.addView(pickBtn1)
 
-        val x1Input = createInput(
-            "X1",
-            InputType.TYPE_CLASS_NUMBER,
-            (oldBundle?.getInt("x", lastX1) ?: lastX1).coerceAtLeast(0).toString()
-        )
-        val y1Input = createInput(
-            "Y1",
-            InputType.TYPE_CLASS_NUMBER,
-            (oldBundle?.getInt("y", lastY1) ?: lastY1).coerceAtLeast(0).toString()
-        )
-        val hex1Input = createInput(
-            "#RRGGBB",
-            InputType.TYPE_CLASS_TEXT,
-            normalizeHexOrDefault(oldBundle?.getString("hex", lastHex1), lastHex1)
-        )
+        val initX1 = oldBundle?.getInt("x", lastX1)?.takeIf { it >= 0 } ?: lastX1
+        val initY1 = oldBundle?.getInt("y", lastY1)?.takeIf { it >= 0 } ?: lastY1
+        val initHex1 = normalizeHexOrDefault(oldBundle?.getString("hex"), lastHex1)
+
+        val x1Input = createInput("X1", InputType.TYPE_CLASS_NUMBER, initX1.toString())
+        val y1Input = createInput("Y1", InputType.TYPE_CLASS_NUMBER, initY1.toString())
+        val hex1Input = createInput("#RRGGBB", InputType.TYPE_CLASS_TEXT, initHex1)
 
         pickBtn1.setOnClickListener {
             val p = getSharedPreferences("fast_auto_prefs", Context.MODE_PRIVATE)
@@ -218,30 +212,22 @@ class PluginConfigActivity : AppCompatActivity() {
         }
         color2Container.addView(pickBtn2)
 
+        val initX2 = oldBundle?.getInt("x2", lastX2)?.takeIf { it >= 0 } ?: lastX2
+        val initY2 = oldBundle?.getInt("y2", lastY2)?.takeIf { it >= 0 } ?: lastY2
+        val initHex2 = normalizeHexOrDefault(oldBundle?.getString("hex2"), lastHex2)
+
         val coord2FieldsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        val x2Input = createInput(
-            "X2",
-            InputType.TYPE_CLASS_NUMBER,
-            (oldBundle?.getInt("x2", lastX2) ?: lastX2).coerceAtLeast(0).toString()
-        )
-        val y2Input = createInput(
-            "Y2",
-            InputType.TYPE_CLASS_NUMBER,
-            (oldBundle?.getInt("y2", lastY2) ?: lastY2).coerceAtLeast(0).toString()
-        )
+        val x2Input = createInput("X2", InputType.TYPE_CLASS_NUMBER, initX2.toString())
+        val y2Input = createInput("Y2", InputType.TYPE_CLASS_NUMBER, initY2.toString())
         coord2FieldsContainer.addView(createLabel("Koordinat Pusat X2:"))
         coord2FieldsContainer.addView(x2Input)
         coord2FieldsContainer.addView(createLabel("Koordinat Pusat Y2:"))
         coord2FieldsContainer.addView(y2Input)
         color2Container.addView(coord2FieldsContainer)
 
-        val hex2Input = createInput(
-            "#RRGGBB",
-            InputType.TYPE_CLASS_TEXT,
-            normalizeHexOrDefault(oldBundle?.getString("hex2", lastHex2), lastHex2)
-        )
+        val hex2Input = createInput("#RRGGBB", InputType.TYPE_CLASS_TEXT, initHex2)
         color2Container.addView(createLabel("Target Warna 2 Hex (#RRGGBB):"))
         color2Container.addView(hex2Input)
 
@@ -366,14 +352,12 @@ class PluginConfigActivity : AppCompatActivity() {
                 val use2 = (mode == ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS) ||
                     (mode == ScreenCaptureService.COLOR_MODE_PICK_ONE && pickOne == ScreenCaptureService.PICK_ONE_COLOR_2)
 
-                var x1 = 0
-                var y1 = 0
-                var rgb1 = 0
-                var hex1 = ""
+                val x1 = (x1Input.text.toString().toIntOrNull() ?: lastX1).coerceAtLeast(0)
+                val y1 = (y1Input.text.toString().toIntOrNull() ?: lastY1).coerceAtLeast(0)
+                var rgb1 = ScreenCaptureService.parseHexToIntOrNull(hex1Input.text.toString().trim()) ?: 0
+                var hex1 = if (rgb1 != 0) String.format("#%06X", rgb1) else normalizeHexOrDefault(hex1Input.text.toString().trim(), lastHex1)
 
                 if (use1) {
-                    x1 = (x1Input.text.toString().toIntOrNull() ?: lastX1).coerceAtLeast(0)
-                    y1 = (y1Input.text.toString().toIntOrNull() ?: lastY1).coerceAtLeast(0)
                     val parsed1 = ScreenCaptureService.parseHexToIntOrNull(hex1Input.text.toString().trim())
                     if (parsed1 == null) {
                         hex1Input.error = "Format Hex harus #RRGGBB (contoh: #FF0000)"
@@ -385,18 +369,15 @@ class PluginConfigActivity : AppCompatActivity() {
                     hex1 = String.format("#%06X", rgb1)
                 }
 
-                var x2 = 0
-                var y2 = 0
-                var rgb2 = 0
-                var hex2 = ""
+                var x2 = (x2Input.text.toString().toIntOrNull() ?: lastX2).coerceAtLeast(0)
+                var y2 = (y2Input.text.toString().toIntOrNull() ?: lastY2).coerceAtLeast(0)
+                var rgb2 = ScreenCaptureService.parseHexToIntOrNull(hex2Input.text.toString().trim()) ?: 0
+                var hex2 = if (rgb2 != 0) String.format("#%06X", rgb2) else normalizeHexOrDefault(hex2Input.text.toString().trim(), lastHex2)
 
                 if (use2) {
                     if (mode == ScreenCaptureService.COLOR_MODE_DUAL_SIMULTANEOUS && sameCoord2 && use1) {
                         x2 = x1
                         y2 = y1
-                    } else {
-                        x2 = (x2Input.text.toString().toIntOrNull() ?: lastX2).coerceAtLeast(0)
-                        y2 = (y2Input.text.toString().toIntOrNull() ?: lastY2).coerceAtLeast(0)
                     }
                     val parsed2 = ScreenCaptureService.parseHexToIntOrNull(hex2Input.text.toString().trim())
                     if (parsed2 == null) {
@@ -456,6 +437,14 @@ class PluginConfigActivity : AppCompatActivity() {
                 val resultIntent = Intent().apply {
                     putExtra("com.twofortyfouram.locale.intent.extra.BUNDLE", resultBundle)
                     putExtra("com.twofortyfouram.locale.intent.extra.BLURB", blurb)
+                    putExtra(
+                        PluginFireReceiver.EXTRA_RELEVANT_VARIABLES,
+                        arrayOf(
+                            "%fastauto_status\nStatus Hasil\nSATISFIED, UNSATISFIED, atau UNKNOWN",
+                            "%fastauto_detail\nDetail Kode\nKode hasil atau alasan error",
+                            "%fastauto_match_count\nJumlah Piksel Cocok\nJumlah piksel yang memenuhi toleransi"
+                        )
+                    )
                 }
                 setResult(RESULT_OK, resultIntent)
                 finish()
@@ -475,12 +464,13 @@ class PluginConfigActivity : AppCompatActivity() {
             )
         }
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        @Suppress("DEPRECATION")
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
         val rot = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                display?.rotation ?: wm.defaultDisplay.rotation
+                dm?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: display?.rotation ?: Surface.ROTATION_0
             } else {
-                wm.defaultDisplay.rotation
+                @Suppress("DEPRECATION")
+                dm?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: wm.defaultDisplay.rotation
             }
         } catch (_: Throwable) {
             Surface.ROTATION_0
