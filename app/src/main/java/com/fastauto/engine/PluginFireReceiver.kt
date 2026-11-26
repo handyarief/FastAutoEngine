@@ -21,7 +21,6 @@ class PluginFireReceiver : BroadcastReceiver() {
         const val EXTRA_OUT_DETAIL = "com.fastauto.engine.extra.DETAIL"
         const val EXTRA_OUT_MATCH_COUNT = "com.fastauto.engine.extra.MATCH_COUNT"
 
-        // 1 worker tetap (parked saat idle -> ~0% CPU, tanpa overhead buat thread baru saat dipanggil)
         private val oneShotExecutor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "FastOneShotWorker").apply {
                 isDaemon = true
@@ -41,26 +40,12 @@ class PluginFireReceiver : BroadcastReceiver() {
         }
 
         if (bundle == null) {
-            finishWithResult(
-                isOrdered = isOrdered,
-                pendingResult = null,
-                code = RESULT_CONDITION_UNKNOWN,
-                status = "UNKNOWN",
-                detail = "MISSING_BUNDLE",
-                matchCount = 0
-            )
+            finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "MISSING_BUNDLE", 0)
             return
         }
 
         if (!ScreenCaptureService.isReady()) {
-            finishWithResult(
-                isOrdered = isOrdered,
-                pendingResult = null,
-                code = RESULT_CONDITION_UNKNOWN,
-                status = "UNKNOWN",
-                detail = "ENGINE_NOT_READY",
-                matchCount = 0
-            )
+            finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "ENGINE_NOT_READY", 0)
             return
         }
 
@@ -69,14 +54,7 @@ class PluginFireReceiver : BroadcastReceiver() {
             colorMode != ScreenCaptureService.COLOR_MODE_SINGLE &&
             colorMode != ScreenCaptureService.COLOR_MODE_PICK_ONE
         ) {
-            finishWithResult(
-                isOrdered = isOrdered,
-                pendingResult = null,
-                code = RESULT_CONDITION_UNKNOWN,
-                status = "UNKNOWN",
-                detail = "INVALID_COLOR_MODE",
-                matchCount = 0
-            )
+            finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_COLOR_MODE", 0)
             return
         }
 
@@ -103,14 +81,16 @@ class PluginFireReceiver : BroadcastReceiver() {
                 finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_COORD_1", 0)
                 return
             }
-            rgb1 = if (bundle.containsKey("rgb1")) {
+            val parsed1 = if (bundle.containsKey("rgb1")) {
                 bundle.getInt("rgb1") and 0xFFFFFF
             } else {
-                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex")) ?: run {
-                    finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_1", 0)
-                    return
-                }
+                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex"))
             }
+            if (parsed1 == null) {
+                finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_1", 0)
+                return
+            }
+            rgb1 = parsed1
         }
 
         var x2 = 0
@@ -123,14 +103,16 @@ class PluginFireReceiver : BroadcastReceiver() {
                 finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_COORD_2", 0)
                 return
             }
-            rgb2 = if (bundle.containsKey("rgb2")) {
+            val parsed2 = if (bundle.containsKey("rgb2")) {
                 bundle.getInt("rgb2") and 0xFFFFFF
             } else {
-                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex2")) ?: run {
-                    finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_2", 0)
-                    return
-                }
+                ScreenCaptureService.parseHexToIntOrNull(bundle.getString("hex2"))
             }
+            if (parsed2 == null) {
+                finishWithResult(isOrdered, null, RESULT_CONDITION_UNKNOWN, "UNKNOWN", "INVALID_HEX_2", 0)
+                return
+            }
+            rgb2 = parsed2
         }
 
         val colorLogic = bundle.getInt("colorLogic", ScreenCaptureService.LOGIC_AND)
@@ -225,7 +207,11 @@ class PluginFireReceiver : BroadcastReceiver() {
             if (isOrdered) {
                 if (pendingResult != null) {
                     pendingResult.resultCode = code
-                    pendingResult.resultExtras = extras
+                    try {
+                        pendingResult.setResultExtras(extras)
+                    } catch (_: Throwable) {
+                        setResultExtras(extras)
+                    }
                 } else {
                     resultCode = code
                     setResultExtras(extras)
