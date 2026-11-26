@@ -10,7 +10,6 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
-import android.hardware.display.MediaProjectionConfig
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
@@ -51,10 +50,6 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "com.fastauto.engine.extra.RESULT_CODE"
         const val EXTRA_DATA = "com.fastauto.engine.extra.DATA"
 
-        // 3 Mode Pemilihan Warna:
-        // 1 = Dua Warna Sekaligus (pada area/koordinat yang sama atau terkonfigurasi dengan logika AND/OR)
-        // 2 = Satu Warna (Warna 1 saja)
-        // 3 = Pilih Salah Satu Warna (pilih Warna 1 saja atau Warna 2 saja sesuai konfigurasi)
         const val COLOR_MODE_DUAL_SIMULTANEOUS = 1
         const val COLOR_MODE_SINGLE = 2
         const val COLOR_MODE_PICK_ONE = 3
@@ -104,10 +99,6 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        /**
-         * Mengaktifkan reader khusus overlay Alat Bidik saat dibuka.
-         * Saat ditutup (false), surface dilepas dan reader ditutup agar kembali True-Idle.
-         */
         fun setPickerActive(active: Boolean) {
             synchronized(stateLock) {
                 pickerActiveFlag = active
@@ -128,13 +119,6 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        /**
-         * Eksekusi ONE-SHOT murni:
-         * 1. Pasang reader jika belum aktif (True-Idle -> Aktif).
-         * 2. Ambil 1 frame segar (tanpa loop polling berulang).
-         * 3. Pindai HANYA area ROI sesuai mode warna yang dipilih.
-         * 4. Lepas reader kembali ke True-Idle (jika tidak sedang dipakai picker).
-         */
         fun evaluateOneShot(
             colorMode: Int,
             pickOneTarget: Int,
@@ -148,9 +132,7 @@ class ScreenCaptureService : Service() {
                 COLOR_MODE_DUAL_SIMULTANEOUS -> COLOR_MODE_DUAL_SIMULTANEOUS
                 COLOR_MODE_SINGLE -> COLOR_MODE_SINGLE
                 COLOR_MODE_PICK_ONE -> COLOR_MODE_PICK_ONE
-                else -> return EvalStatus.ERR_INVALID_CONFIG.let {
-                    EvalOutcome(it, 0, "INVALID_COLOR_MODE")
-                }
+                else -> return EvalOutcome(EvalStatus.ERR_INVALID_CONFIG, 0, "INVALID_COLOR_MODE")
             }
 
             val useColor1: Boolean
@@ -183,16 +165,12 @@ class ScreenCaptureService : Service() {
 
             var acquiredHere = false
             var prevFrameSeq = 0L
-            var curW: Int
-            var curH: Int
-            var curRot: Int
+            val curRot: Int
 
             synchronized(stateLock) {
                 if (mediaProjection == null || virtualDisplay == null || screenWidth <= 0 || screenHeight <= 0) {
                     return EvalOutcome(EvalStatus.ERR_ENGINE_NOT_READY, 0, "ENGINE_NOT_READY")
                 }
-                curW = screenWidth
-                curH = screenHeight
                 curRot = screenRotation
                 prevFrameSeq = synchronized(frameLock) { frameCounter }
 
@@ -204,7 +182,6 @@ class ScreenCaptureService : Service() {
             }
 
             try {
-                // Tunggu hingga tersedia frame baru setelah surface terpasang (maksimal 1 siklus tunggu singkat)
                 val deadlineNanos = System.nanoTime() + (SINGLE_FRAME_WAIT_MS * 1_000_000L)
                 var image: Image? = acquireFreshImageLocked()
 
@@ -219,7 +196,6 @@ class ScreenCaptureService : Service() {
                                 frameLock.wait(waitMs)
                             } catch (_: InterruptedException) {
                                 Thread.currentThread().interrupt()
-                                break
                             }
                         }
                         prevFrameSeq = frameCounter
@@ -274,9 +250,6 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        /**
-         * Membaca 1 piksel segar untuk Alat Bidik di MainActivity (dipanggil dari background thread).
-         */
         fun getPixelHex(x: Int, y: Int): String? {
             var tempReader = false
             var prevSeq = 0L
@@ -300,43 +273,39 @@ class ScreenCaptureService : Service() {
                 var img: Image? = acquireFreshImageLocked()
 
                 while (img == null && pickerHoldsReader && latestPickerImage != null) {
-                    // Saat picker aktif dan tidak ada frame baru dalam micro-window, pakai frame picker terbaru
                     val rem = deadlineNanos - System.nanoTime()
                     if (rem <= (SINGLE_FRAME_WAIT_MS * 500_000L)) {
                         img = latestPickerImage
-                        break
-                    }
-                    synchronized(frameLock) {
-                        if (frameCounter == prevSeq) {
-                            try {
-                                frameLock.wait(20L)
-                            } catch (_: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                break
-                            }
-                        }
-                        prevSeq = frameCounter
-                    }
-                    img = acquireFreshImageLocked()
-                }
-
-                if (img == null) {
-                    while (img == null) {
-                        val rem = deadlineNanos - System.nanoTime()
-                        if (rem <= 0L) break
+                    } else {
                         synchronized(frameLock) {
                             if (frameCounter == prevSeq) {
                                 try {
-                                    frameLock.wait(25L)
+                                    frameLock.wait(20L)
                                 } catch (_: InterruptedException) {
                                     Thread.currentThread().interrupt()
-                                    break
                                 }
                             }
                             prevSeq = frameCounter
                         }
                         img = acquireFreshImageLocked()
                     }
+                    if (img != null) break
+                }
+
+                while (img == null) {
+                    val rem = deadlineNanos - System.nanoTime()
+                    if (rem <= 0L) break
+                    synchronized(frameLock) {
+                        if (frameCounter == prevSeq) {
+                            try {
+                                frameLock.wait(25L)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                        }
+                        prevSeq = frameCounter
+                    }
+                    img = acquireFreshImageLocked()
                 }
 
                 val target = img ?: return null
@@ -369,10 +338,6 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        /**
-         * Memetakan koordinat dari dimensi referensi saat konfigurasi ke buffer aktual
-         * (menangani perubahan resolusi dan orientasi layar).
-         */
         fun mapCoordinateToCurrentBuffer(
             x: Int,
             y: Int,
@@ -394,22 +359,23 @@ class ScreenCaptureService : Service() {
             val mappedX: Int
             val mappedY: Int
 
-            if (rotDiff == 1) {
-                // Rotasi searah jarum jam 90 derajat
-                mappedX = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufW) / srcH).toInt()
-                mappedY = ((safeX.toLong() * bufH) / srcW).toInt()
-            } else if (rotDiff == 3) {
-                // Rotasi berlawanan arah jarum jam 90 derajat (270 derajat)
-                mappedX = ((safeY.toLong() * bufW) / srcH).toInt()
-                mappedY = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufH) / srcW).toInt()
-            } else if (rotDiff == 2) {
-                // Rotasi 180 derajat
-                mappedX = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufW) / srcW).toInt()
-                mappedY = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufH) / srcH).toInt()
-            } else {
-                // Orientasi sama; skala proporsional bila resolusi berubah
-                mappedX = ((safeX.toLong() * bufW) / srcW).toInt()
-                mappedY = ((safeY.toLong() * bufH) / srcH).toInt()
+            when (rotDiff) {
+                1 -> {
+                    mappedX = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufW) / srcH).toInt()
+                    mappedY = ((safeX.toLong() * bufH) / srcW).toInt()
+                }
+                3 -> {
+                    mappedX = ((safeY.toLong() * bufW) / srcH).toInt()
+                    mappedY = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufH) / srcW).toInt()
+                }
+                2 -> {
+                    mappedX = (((srcW - 1 - safeX).coerceAtLeast(0).toLong() * bufW) / srcW).toInt()
+                    mappedY = (((srcH - 1 - safeY).coerceAtLeast(0).toLong() * bufH) / srcH).toInt()
+                }
+                else -> {
+                    mappedX = ((safeX.toLong() * bufW) / srcW).toInt()
+                    mappedY = ((safeY.toLong() * bufH) / srcH).toInt()
+                }
             }
 
             return Pair(
@@ -451,9 +417,9 @@ class ScreenCaptureService : Service() {
         private fun readRgbHexFromImage(img: Image, x: Int, y: Int): String? {
             return try {
                 val planes = img.planes
-                if (planes.isNullOrEmpty()) return null
+                if (planes.isEmpty()) return null
                 val plane = planes[0]
-                val buf = plane.buffer ?: return null
+                val buf = plane.buffer
                 val w = img.width
                 val h = img.height
                 val rs = plane.rowStride
@@ -487,10 +453,6 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        /**
-         * Pemindaian ROI berurutan per baris (row-major) agar ramah CPU cache,
-         * tanpa alokasi objek di dalam loop, dan mematuhi mode 1 / 2 / 3.
-         */
         private fun evaluateRoiOnce(
             image: Image,
             useColor1: Boolean,
@@ -503,12 +465,12 @@ class ScreenCaptureService : Service() {
             tolerance: Int,
             minMatches: Int
         ): EvalOutcome {
-            val planes = try { image.planes } catch (_: Throwable) { null } ?: return EvalOutcome(
-                EvalStatus.ERR_CAPTURE_FAILED, 0, "NO_PLANES"
-            )
-            if (planes.isEmpty()) return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "EMPTY_PLANES")
+            val planes = try { image.planes } catch (_: Throwable) { null }
+            if (planes == null || planes.isEmpty()) {
+                return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "EMPTY_PLANES")
+            }
             val plane = planes[0]
-            val buf = plane.buffer ?: return EvalOutcome(EvalStatus.ERR_CAPTURE_FAILED, 0, "NULL_BUFFER")
+            val buf = plane.buffer
 
             val w = image.width
             val h = image.height
@@ -590,7 +552,6 @@ class ScreenCaptureService : Service() {
             val top = (centerY - radius).coerceIn(0, height - 1)
             val bottom = (centerY + radius).coerceIn(0, height - 1)
 
-            // Batas jarak kuadrat gabungan (ringan dan mengurangi error akibat shading/gamma)
             val maxChannelDistSq = tolerance * tolerance * 3
 
             var matches = 0
@@ -629,9 +590,12 @@ class ScreenCaptureService : Service() {
                     }
                     x += step
                 }
-                if (y == bottom) break
-                val nextY = y + step
-                y = if (nextY > bottom) bottom else nextY
+                if (y == bottom) {
+                    y = bottom + 1
+                } else {
+                    val nextY = y + step
+                    y = if (nextY > bottom) bottom else nextY
+                }
             }
             return matches
         }
@@ -835,19 +799,6 @@ class ScreenCaptureService : Service() {
             }
         }, handler)
 
-        // Android 14+ (API 34): paksa tangkapan layar penuh default display agar koordinat konsisten
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            try {
-                projection.launchCookie
-                val config = MediaProjectionConfig.createConfigForDefaultDisplay()
-                // Catatan: createScreenCaptureIntent menerima config saat meminta izin;
-                // di sisi service kita tetap membuat VirtualDisplay dengan surface=null untuk True-Idle.
-                @Suppress("UNUSED_VARIABLE")
-                val unusedConfig = config
-            } catch (_: Throwable) {}
-        }
-
-        // VirtualDisplay dibuat dengan surface = null -> kondisi awal True-Idle (0 frame aktif)
         val vd = projection.createVirtualDisplay(
             "FastAutoColorEngine",
             w, h, dpi,
