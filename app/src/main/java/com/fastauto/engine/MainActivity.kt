@@ -14,7 +14,6 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.hardware.display.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -218,17 +217,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchScreenCaptureConsent() {
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            try {
-                mpManager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
-            } catch (_: Throwable) {
-                @Suppress("DEPRECATION")
-                mpManager.createScreenCaptureIntent()
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            mpManager.createScreenCaptureIntent()
-        }
+        @Suppress("DEPRECATION")
+        val intent = mpManager.createScreenCaptureIntent()
         @Suppress("DEPRECATION")
         startActivityForResult(intent, REQ_MEDIA_PROJECTION)
     }
