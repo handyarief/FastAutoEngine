@@ -7,12 +7,14 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -61,7 +63,9 @@ class MainActivity : AppCompatActivity() {
     private var lastPickedHex = "#FF0000"
 
     private val uiHandler = Handler(Looper.getMainLooper())
-    private val pickerExecutor = Executors.newSingleThreadExecutor()
+    private val pickerExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "FastPickerSampleThread").apply { isDaemon = true }
+    }
     private val isSamplingInFlight = AtomicBoolean(false)
     private var lastSampleUptimeMs = 0L
 
@@ -158,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(title)
 
         val subtitle = TextView(this).apply {
-            text = "Mesin Pemindai Area Sekitar (1 atau 2 Warna, On-Demand True-Idle) untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan Automate agar garis bidik tidak menghalangi layar."
+            text = "Mesin Pemindai Area One-Shot untuk Automate.\n\nPENTING: Tutup alat bidik (klik ✕) sebelum menjalankan flow Automate agar overlay tidak menghalangi layar dan sesi kembali True-Idle."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, dp(10))
@@ -174,9 +178,7 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(statusText)
 
         mainLayout.addView(createButton("1. Aktifkan Mesin Area RAM (Wajib)", "#8E24AA") {
-            val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            @Suppress("DEPRECATION")
-            startActivityForResult(mpManager.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
+            launchScreenCaptureConsent()
         })
 
         mainLayout.addView(createButton("2. Munculkan Alat Bidik Pusat Area (🎯)", "#00897B") {
@@ -197,8 +199,16 @@ class MainActivity : AppCompatActivity() {
             val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
                 action = ScreenCaptureService.ACTION_STOP_SERVICE
             }
-            stopService(stopIntent)
-            statusText.postDelayed({ updateStatus() }, 250)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                try {
+                    startForegroundService(stopIntent)
+                } catch (_: Throwable) {
+                    stopService(stopIntent)
+                }
+            } else {
+                stopService(stopIntent)
+            }
+            statusText.postDelayed({ updateStatus() }, 200)
             Toast.makeText(this, "Mesin pembaca warna dimatikan (True-Idle)", Toast.LENGTH_SHORT).show()
         })
 
@@ -206,11 +216,45 @@ class MainActivity : AppCompatActivity() {
         updateStatus()
     }
 
+    private fun launchScreenCaptureConsent() {
+        val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                mpManager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            } catch (_: Throwable) {
+                @Suppress("DEPRECATION")
+                mpManager.createScreenCaptureIntent()
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            mpManager.createScreenCaptureIntent()
+        }
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, REQ_MEDIA_PROJECTION)
+    }
+
     private fun hasOverlayPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Settings.canDrawOverlays(this)
         } else {
             true
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (floatingView != null || crosshairView != null || dpadView != null) {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val (maxW, maxH) = getExactScreenSize()
+            val sizePx = crosshairSizePx()
+            cParamsRef?.let { cp ->
+                cp.x = cp.x.coerceIn(0, (maxW - sizePx).coerceAtLeast(0))
+                cp.y = cp.y.coerceIn(0, (maxH - sizePx).coerceAtLeast(0))
+                crosshairView?.let { cv ->
+                    try { wm.updateViewLayout(cv, cp) } catch (_: Throwable) {}
+                }
+            }
+            syncAndRefreshFromCrosshair(forceSample = true)
         }
     }
 
@@ -229,7 +273,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         val colorOk = ScreenCaptureService.isReady()
         statusText.text = if (colorOk) {
-            "Mesin Area RAM: ✅ AKTIF (Siap On-Demand, True-Idle saat tidak dipanggil)"
+            "Mesin Area RAM: ✅ AKTIF (One-Shot, True-Idle saat tidak dipanggil)"
         } else {
             "Mesin Area RAM: ❌ MATI"
         }
@@ -261,7 +305,7 @@ class MainActivity : AppCompatActivity() {
         colorPreviewDrawable = null
     }
 
-    private fun syncAndRefreshFromCrosshair(onDone: (() -> Unit)? = null) {
+    private fun syncAndRefreshFromCrosshair(forceSample: Boolean = true, onDone: (() -> Unit)? = null) {
         val target = crosshairView ?: run {
             onDone?.invoke()
             return
@@ -282,18 +326,20 @@ class MainActivity : AppCompatActivity() {
 
             val trueCenterX = loc[0] + (target.width / 2)
             val trueCenterY = loc[1] + (target.height / 2)
-            updateCoordinatesAndSample(trueCenterX, trueCenterY, forceSample = true, onDone = onDone)
+            updateCoordinatesAndSample(trueCenterX, trueCenterY, forceSample = forceSample, onDone = onDone)
 
-            delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
-            delayedSampleRunnable = Runnable {
-                val curTarget = crosshairView ?: return@Runnable
-                val locAfter = IntArray(2)
-                curTarget.getLocationOnScreen(locAfter)
-                val cx = locAfter[0] + (curTarget.width / 2)
-                val cy = locAfter[1] + (curTarget.height / 2)
-                updateCoordinatesAndSample(cx, cy, forceSample = true)
+            if (forceSample) {
+                delayedSampleRunnable?.let { uiHandler.removeCallbacks(it) }
+                delayedSampleRunnable = Runnable {
+                    val curTarget = crosshairView ?: return@Runnable
+                    val locAfter = IntArray(2)
+                    curTarget.getLocationOnScreen(locAfter)
+                    val cx = locAfter[0] + (curTarget.width / 2)
+                    val cy = locAfter[1] + (curTarget.height / 2)
+                    updateCoordinatesAndSample(cx, cy, forceSample = true)
+                }
+                uiHandler.postDelayed(delayedSampleRunnable!!, DELAYED_SAMPLE_MS)
             }
-            uiHandler.postDelayed(delayedSampleRunnable!!, DELAYED_SAMPLE_MS)
         }
     }
 
@@ -327,7 +373,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!isSamplingInFlight.compareAndSet(false, true)) {
-            onDone?.invoke()
+            if (forceSample) {
+                uiHandler.postDelayed({
+                    updateCoordinatesAndSample(rawX, rawY, forceSample = true, onDone = onDone)
+                }, 25L)
+            } else {
+                onDone?.invoke()
+            }
             return
         }
 
@@ -340,8 +392,9 @@ class MainActivity : AppCompatActivity() {
                 ScreenCaptureService.getPixelHex(targetX, targetY)
             } catch (_: Throwable) {
                 null
+            } finally {
+                isSamplingInFlight.set(false)
             }
-            isSamplingInFlight.set(false)
 
             uiHandler.post {
                 if (floatingView == null) {
@@ -362,7 +415,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun moveCrosshairBy(dx: Int, dy: Int) {
+    private fun moveCrosshairBy(dx: Int, dy: Int, finalStep: Boolean = false) {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val target = crosshairView ?: return
         val cParams = cParamsRef ?: return
@@ -385,7 +438,7 @@ class MainActivity : AppCompatActivity() {
             wm.updateViewLayout(target, cParams)
         } catch (_: Exception) {}
 
-        syncAndRefreshFromCrosshair()
+        syncAndRefreshFromCrosshair(forceSample = finalStep)
     }
 
     private fun stopRepeatMove() {
@@ -394,7 +447,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveAreaSlot(slot: Int) {
-        syncAndRefreshFromCrosshair {
+        syncAndRefreshFromCrosshair(forceSample = true) {
             val xKey = if (slot == 1) "picked_x" else "picked_x2"
             val yKey = if (slot == 1) "picked_y" else "picked_y2"
             val hexKey = if (slot == 1) "picked_hex" else "picked_hex2"
@@ -573,7 +626,6 @@ class MainActivity : AppCompatActivity() {
             applyCutoutMode(this)
         }
 
-        // Menggeser panel info tidak perlu memicu pembacaan warna crosshair
         makeDraggable(panel, params, wm, refreshOnMove = false)
 
         wm.addView(panel, params)
@@ -581,7 +633,7 @@ class MainActivity : AppCompatActivity() {
 
         showHollowCrosshair(wm)
         showDraggableJoystick(wm)
-        syncAndRefreshFromCrosshair()
+        syncAndRefreshFromCrosshair(forceSample = true)
     }
 
     private fun showDraggableJoystick(wm: WindowManager) {
@@ -642,11 +694,11 @@ class MainActivity : AppCompatActivity() {
                     when (event.action) {
                         MotionEvent.ACTION_DOWN -> {
                             v.background = pressedBg
-                            moveCrosshairBy(dx, dy)
+                            moveCrosshairBy(dx, dy, finalStep = false)
                             stopRepeatMove()
                             repeatRunnable = object : Runnable {
                                 override fun run() {
-                                    moveCrosshairBy(dx, dy)
+                                    moveCrosshairBy(dx, dy, finalStep = false)
                                     uiHandler.postDelayed(this, 45L)
                                 }
                             }
@@ -656,6 +708,7 @@ class MainActivity : AppCompatActivity() {
                         MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                             v.background = normalBg
                             stopRepeatMove()
+                            moveCrosshairBy(0, 0, finalStep = true)
                             true
                         }
                         else -> false
@@ -731,14 +784,25 @@ class MainActivity : AppCompatActivity() {
                         touchY = e.rawY
                         return true
                     }
-                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                    MotionEvent.ACTION_MOVE -> {
                         layoutParams.x = initX + (e.rawX - touchX).toInt()
                         layoutParams.y = initY + (e.rawY - touchY).toInt()
                         try {
                             wm.updateViewLayout(targetViewToUpdate, layoutParams)
                         } catch (_: Exception) {}
                         if (refreshOnMove) {
-                            syncAndRefreshFromCrosshair()
+                            syncAndRefreshFromCrosshair(forceSample = false)
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        layoutParams.x = initX + (e.rawX - touchX).toInt()
+                        layoutParams.y = initY + (e.rawY - touchY).toInt()
+                        try {
+                            wm.updateViewLayout(targetViewToUpdate, layoutParams)
+                        } catch (_: Exception) {}
+                        if (refreshOnMove) {
+                            syncAndRefreshFromCrosshair(forceSample = true)
                         }
                         return true
                     }
@@ -808,14 +872,22 @@ class MainActivity : AppCompatActivity() {
                         touchY = e.rawY
                         return true
                     }
-                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                    MotionEvent.ACTION_MOVE -> {
                         cParams.x = initX + (e.rawX - touchX).toInt()
                         cParams.y = initY + (e.rawY - touchY).toInt()
                         try {
                             wm.updateViewLayout(target, cParams)
                         } catch (_: Exception) {}
-
-                        syncAndRefreshFromCrosshair()
+                        syncAndRefreshFromCrosshair(forceSample = false)
+                        return true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        cParams.x = initX + (e.rawX - touchX).toInt()
+                        cParams.y = initY + (e.rawY - touchY).toInt()
+                        try {
+                            wm.updateViewLayout(target, cParams)
+                        } catch (_: Exception) {}
+                        syncAndRefreshFromCrosshair(forceSample = true)
                         return true
                     }
                 }
@@ -841,7 +913,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 startService(serviceIntent)
             }
-            statusText.postDelayed({ updateStatus() }, 400)
+            statusText.postDelayed({ updateStatus() }, 250)
         } else if (requestCode == REQ_OVERLAY_PERMISSION) {
             if (hasOverlayPermission()) {
                 showFloatingPicker()
