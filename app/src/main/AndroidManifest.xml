@@ -28,6 +28,7 @@
             android:name=".PluginConfigActivity"
             android:exported="true"
             android:label="⚡ FastAuto Cari Warna Area"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="com.twofortyfouram.locale.intent.action.EDIT_CONDITION" />
